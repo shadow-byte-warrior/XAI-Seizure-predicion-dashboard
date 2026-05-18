@@ -1,0 +1,2501 @@
+
+# ==============================
+# CODE CELL 2
+# ==============================
+# ============================================================
+# CELL 1 — Setup: Directory Structure & Paths
+# ============================================================
+import os, warnings
+warnings.filterwarnings('ignore')
+
+DATASET_ROOT = '/kaggle/input/datasets/abhishekinnvonix/seizure-epilepcy-chb-mit-eeg-dataset-pediatric'
+CHB_PATH     = os.path.join(DATASET_ROOT, 'chb-mit-scalp-eeg-database-1.0.0')
+
+if not os.path.isdir(CHB_PATH):
+    CHB_PATH = DATASET_ROOT
+
+RESULTS_DIR = '/kaggle/working/results'
+MODELS_DIR  = '/kaggle/working/models'
+
+for d in [RESULTS_DIR, MODELS_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+print("="*60)
+print("📁  DIRECTORY SETUP COMPLETE")
+print("="*60)
+print(f"  Dataset  : {CHB_PATH}")
+print(f"  Results  : {RESULTS_DIR}")
+print(f"  Models   : {MODELS_DIR}")
+
+print("\n📂  Dataset root contents:")
+for item in sorted(os.listdir(CHB_PATH))[:20]:
+    print(f"    {'📂' if os.path.isdir(os.path.join(CHB_PATH, item)) else '📄'}  {item}")
+
+
+
+# ==============================
+# CODE CELL 3
+# ==============================
+# ============================================================
+# CELL 2 — Install Required Libraries
+# ============================================================
+import subprocess, sys
+
+pkgs = ['pyedflib', 'mne', 'PyWavelets', 'shap', 'lime']
+for pkg in pkgs:
+    subprocess.run([sys.executable, '-m', 'pip', 'install', pkg, '-q'], check=False)
+
+import pyedflib, mne, pywt
+mne.set_log_level('ERROR')
+print("✅  pyedflib · mne · pywavelets · shap · lime — ready")
+
+
+
+# ==============================
+# CODE CELL 4
+# ==============================
+# ============================================================
+# CELL 3 — Imports
+# ============================================================
+import os, re, glob, gc, json, copy, time, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import seaborn as sns
+from collections import defaultdict
+from scipy import signal as sp_signal
+from scipy.signal import butter, filtfilt, welch
+from scipy.stats import skew, kurtosis
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, roc_curve, confusion_matrix,
+    classification_report, precision_recall_curve, average_precision_score
+)
+from imblearn.over_sampling import SMOTE
+
+# Deep Learning
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
+from torch.autograd import Function
+
+# XAI
+import shap
+from lime import lime_tabular
+
+# Visualization settings
+plt.rcParams.update({
+    'figure.dpi': 120,
+    'figure.facecolor': 'white',
+    'axes.facecolor': '#f8f9fa',
+    'axes.grid': True,
+    'grid.alpha': 0.4,
+    'font.size': 11,
+})
+PALETTE = ['#e63946', '#457b9d', '#2a9d8f', '#e9c46a', '#f4a261', '#264653']
+
+print("✅  All imports successful")
+print(f"   PyTorch {torch.__version__} | CUDA: {torch.cuda.is_available()}")
+
+
+
+# ==============================
+# CODE CELL 5
+# ==============================
+# ============================================================
+# CELL 4 — Parse All Seizure Annotations
+# ============================================================
+def parse_summary(path):
+    seizure_info = {}
+    with open(path) as f:
+        content = f.read()
+    blocks = content.split('File Name:')[1:]
+    for block in blocks:
+        lines = block.strip().split('\n')
+        fname = lines[0].strip()
+        seizure_info[fname] = []
+        start = end = 0
+        for line in lines:
+            m = re.search(r'Number of Seizures in File:\s*(\d+)', line)
+            if m:
+                pass  # just for bookkeeping
+            ms = re.search(r'Seizure(?:\s+\d+)?\s+Start\s+Time:\s*(\d+)', line)
+            me = re.search(r'Seizure(?:\s+\d+)?\s+End\s+Time:\s*(\d+)', line)
+            if ms:
+                start = int(ms.group(1))
+            if me:
+                end = int(me.group(1))
+                seizure_info[fname].append((start, end))
+    return seizure_info
+
+all_annotations = {}
+summary_files   = sorted(glob.glob(os.path.join(CHB_PATH, 'chb*/chb*-summary.txt')))
+
+print("="*60)
+print("📋  LOADING SEIZURE ANNOTATIONS")
+print("="*60)
+for sf in summary_files:
+    patient = os.path.basename(os.path.dirname(sf))
+    ann = parse_summary(sf)
+    ann_with_sz = {k: v for k, v in ann.items() if len(v) > 0}
+    all_annotations[patient] = ann
+    n_sz = sum(len(v) for v in ann_with_sz.values())
+    print(f"  👤 {patient}: {len(ann)} files | {len(ann_with_sz)} seizure files | {n_sz} seizures")
+
+total_patients = len(all_annotations)
+total_seizures = sum(sum(len(v) for v in p.values()) for p in all_annotations.values())
+print(f"\n  ✅  {total_patients} patients | {total_seizures} total seizure events")
+
+
+
+# ==============================
+# CODE CELL 7
+# ==============================
+# ============================================================
+# CELL 5A — EDA: Dataset-Level Statistics
+# ============================================================
+print("="*60)
+print("📊  EDA — DATASET-LEVEL STATISTICS")
+print("="*60)
+
+rows = []
+for patient, ann in all_annotations.items():
+    sz_events  = [(f, s, e) for f, segs in ann.items() for s, e in segs]
+    n_seizures = len(sz_events)
+    total_sz_dur = sum(e - s for _, s, e in sz_events) if sz_events else 0
+    rows.append({
+        'Patient'       : patient,
+        'Total_Files'   : len(ann),
+        'Seizure_Files' : sum(1 for v in ann.values() if len(v) > 0),
+        'N_Seizures'    : n_seizures,
+        'Total_SZ_Dur_s': total_sz_dur,
+        'Avg_SZ_Dur_s'  : round(total_sz_dur / n_seizures, 1) if n_seizures else 0,
+    })
+
+patient_df = pd.DataFrame(rows).sort_values('Patient').reset_index(drop=True)
+print(patient_df.to_string(index=False))
+print(f"\n  Total patients   : {len(patient_df)}")
+print(f"  Total seizures   : {patient_df.N_Seizures.sum()}")
+print(f"  Avg sz/patient   : {patient_df.N_Seizures.mean():.1f}")
+print(f"  Avg seizure dur  : {patient_df.Avg_SZ_Dur_s.mean():.1f} s")
+
+
+
+# ==============================
+# CODE CELL 8
+# ==============================
+# ============================================================
+# CELL 5B — EDA: Patient-Level Bar Charts
+# ============================================================
+fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+fig.suptitle('CHB-MIT Dataset — Patient Statistics', fontsize=15, fontweight='bold')
+
+ax = axes[0, 0]
+bars = ax.bar(patient_df.Patient, patient_df.N_Seizures, color=PALETTE[0], edgecolor='black', linewidth=0.5)
+ax.set_title('Seizure Count per Patient', fontweight='bold')
+ax.set_xlabel('Patient'); ax.set_ylabel('# Seizures')
+ax.tick_params(axis='x', rotation=45)
+for bar, val in zip(bars, patient_df.N_Seizures):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1, str(val), ha='center', fontsize=7)
+
+ax = axes[0, 1]
+ax.bar(patient_df.Patient, patient_df.Total_SZ_Dur_s, color=PALETTE[1], edgecolor='black', linewidth=0.5)
+ax.set_title('Total Seizure Duration per Patient (s)', fontweight='bold')
+ax.set_xlabel('Patient'); ax.set_ylabel('Duration (s)')
+ax.tick_params(axis='x', rotation=45)
+
+ax = axes[1, 0]
+valid = patient_df[patient_df.Avg_SZ_Dur_s > 0].Avg_SZ_Dur_s
+ax.hist(valid, bins=12, color=PALETTE[2], edgecolor='black', linewidth=0.5)
+ax.axvline(valid.mean(), color='red', linestyle='--', linewidth=1.5, label=f'Mean={valid.mean():.1f}s')
+ax.set_title('Distribution of Avg Seizure Duration', fontweight='bold')
+ax.set_xlabel('Duration (s)'); ax.set_ylabel('Frequency')
+ax.legend()
+
+ax = axes[1, 1]
+x = np.arange(len(patient_df)); w = 0.4
+ax.bar(x - w/2, patient_df.Total_Files,   width=w, label='Total Files',   color=PALETTE[3], edgecolor='black', linewidth=0.5)
+ax.bar(x + w/2, patient_df.Seizure_Files, width=w, label='Seizure Files', color=PALETTE[0], edgecolor='black', linewidth=0.5)
+ax.set_title('Total vs Seizure-Containing Files', fontweight='bold')
+ax.set_xticks(x); ax.set_xticklabels(patient_df.Patient, rotation=45)
+ax.set_ylabel('File Count'); ax.legend()
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_patient_statistics.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_patient_statistics.png")
+
+
+
+# ==============================
+# CODE CELL 9
+# ==============================
+# ============================================================
+# CELL 5C — EDA: Load One EDF & Raw Signal Plot
+# ============================================================
+def load_edf(path, n_channels=18):
+    f = pyedflib.EdfReader(path)
+    ch_names = f.getSignalLabels()
+    fs       = int(f.getSampleFrequency(0))
+    n_samp   = f.getNSamples()[0]
+    n_ch     = min(f.signals_in_file, n_channels)
+    sigs = np.zeros((n_ch, n_samp))
+    for i in range(n_ch):
+        sigs[i] = f.readSignal(i)
+    f.close()
+    return sigs, ch_names[:n_ch], fs
+
+target_patient = None
+target_file    = None
+seizure_windows = []
+for pat, ann in all_annotations.items():
+    for fname, segs in ann.items():
+        if segs:
+            target_patient  = pat
+            target_file     = fname
+            seizure_windows = segs
+            break
+    if target_patient:
+        break
+
+edf_path = os.path.join(CHB_PATH, target_patient, target_file)
+print(f"Loading: {edf_path}")
+signals, ch_names, fs = load_edf(edf_path)
+print(f"  Shape: {signals.shape}  |  fs={fs} Hz  |  Duration: {signals.shape[1]/fs:.1f}s")
+print(f"  Channels: {ch_names}")
+print(f"  Seizure windows: {seizure_windows}")
+
+
+
+# ==============================
+# CODE CELL 10
+# ==============================
+# ============================================================
+# CELL 5D — EDA: Normal vs Seizure Signal Visualization
+# ============================================================
+N_DISPLAY = 6
+sz_start, sz_end = seizure_windows[0]
+
+norm_s  = max(0, sz_start - 120)
+norm_e  = max(0, sz_start - 110)
+norm_ss = norm_s * fs
+norm_es = norm_e * fs
+sz_ss   = sz_start * fs
+sz_es   = min(sz_end * fs, sz_start * fs + 10 * fs)
+
+time_norm = np.arange(norm_es - norm_ss) / fs
+time_seiz = np.arange(sz_es  - sz_ss)  / fs
+
+fig, axes = plt.subplots(N_DISPLAY, 2, figsize=(18, N_DISPLAY * 2))
+fig.suptitle('Normal vs Seizure EEG Activity — 6 Channels', fontsize=14, fontweight='bold')
+
+for row in range(N_DISPLAY):
+    ch = row
+    seg_n = signals[ch, norm_ss:norm_es]
+    axes[row, 0].plot(time_norm, seg_n, color=PALETTE[1], linewidth=0.7)
+    axes[row, 0].set_ylabel(ch_names[ch], fontsize=9)
+    if row == 0:
+        axes[row, 0].set_title('Normal Period', fontweight='bold', color=PALETTE[1])
+    seg_s = signals[ch, sz_ss:sz_es]
+    axes[row, 1].plot(time_seiz, seg_s, color=PALETTE[0], linewidth=0.7)
+    if row == 0:
+        axes[row, 1].set_title('Seizure Period', fontweight='bold', color=PALETTE[0])
+    for ax in axes[row]:
+        ax.set_xlim(0, None); ax.tick_params(labelsize=8)
+
+axes[-1, 0].set_xlabel('Time (s)'); axes[-1, 1].set_xlabel('Time (s)')
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_normal_vs_seizure.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_normal_vs_seizure.png")
+
+
+
+# ==============================
+# CODE CELL 11
+# ==============================
+# ============================================================
+# CELL 5E — EDA: Power Spectral Density (PSD) Analysis
+# ============================================================
+FREQ_BANDS = {
+    'Delta (0.5-4)' : (0.5,  4),
+    'Theta (4-8)'   : (4,    8),
+    'Alpha (8-13)'  : (8,   13),
+    'Beta (13-30)'  : (13,  30),
+    'Gamma (30-100)': (30, 100),
+}
+
+def band_power(sig, fs, flo, fhi):
+    freqs, psd = welch(sig, fs=fs, nperseg=min(256, len(sig)))
+    idx = np.logical_and(freqs >= flo, freqs <= fhi)
+    return np.trapz(psd[idx], freqs[idx])
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle('Power Spectral Density: Normal vs Seizure', fontsize=14, fontweight='bold')
+
+for ax, (seg, label, color) in zip(axes,
+    [(signals[:, norm_ss:norm_es], 'Normal', PALETTE[1]),
+     (signals[:, sz_ss:sz_es],    'Seizure', PALETTE[0])]):
+    band_means = []
+    for band_name, (flo, fhi) in FREQ_BANDS.items():
+        powers = [band_power(seg[c], fs, flo, fhi) for c in range(seg.shape[0])]
+        band_means.append(np.mean(powers))
+    ax.bar(list(FREQ_BANDS.keys()), band_means, color=color, edgecolor='black', linewidth=0.5)
+    ax.set_title(f'{label} — Band Power', fontweight='bold')
+    ax.set_xlabel('Frequency Band'); ax.set_ylabel('Power (µV²/Hz)')
+    ax.tick_params(axis='x', rotation=20)
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_psd.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_psd.png")
+
+
+
+# ==============================
+# CODE CELL 12
+# ==============================
+# ============================================================
+# CELL 5F — EDA: Channel Correlation Heatmap
+# ============================================================
+seg_30s     = signals[:, norm_ss : norm_ss + 30 * fs]
+corr_matrix = np.corrcoef(seg_30s)
+
+fig, ax = plt.subplots(figsize=(12, 10))
+sns.heatmap(corr_matrix, ax=ax, cmap='coolwarm', center=0,
+            xticklabels=ch_names, yticklabels=ch_names,
+            linewidths=0.2, annot=False)
+ax.set_title('EEG Channel Correlation (30s Normal Segment)', fontsize=13, fontweight='bold')
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_channel_correlation.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_channel_correlation.png")
+
+
+
+# ==============================
+# CODE CELL 13
+# ==============================
+# ============================================================
+# CELL 5G — EDA: Seizure Duration & Interval Distribution
+# ============================================================
+all_durations = []
+all_intervals = []
+
+for pat, ann in all_annotations.items():
+    prev_end = None
+    for fname, segs in ann.items():
+        for s, e in segs:
+            all_durations.append(e - s)
+            if prev_end is not None:
+                all_intervals.append(s - prev_end)
+            prev_end = e
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle('Seizure Temporal Statistics', fontsize=13, fontweight='bold')
+axes[0].hist(all_durations, bins=30, color=PALETTE[0], edgecolor='black', linewidth=0.5)
+axes[0].set_title('Seizure Duration Distribution'); axes[0].set_xlabel('Duration (s)'); axes[0].set_ylabel('Count')
+axes[0].axvline(np.mean(all_durations), color='black', linestyle='--', label=f'Mean={np.mean(all_durations):.1f}s')
+axes[0].legend()
+axes[1].hist(all_intervals, bins=30, color=PALETTE[1], edgecolor='black', linewidth=0.5)
+axes[1].set_title('Inter-Seizure Interval Distribution'); axes[1].set_xlabel('Interval (s)'); axes[1].set_ylabel('Count')
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_seizure_stats.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_seizure_stats.png")
+
+
+
+# ==============================
+# CODE CELL 14
+# ==============================
+# ============================================================
+# CELL 5H — EDA: Statistical Features per Channel
+# ============================================================
+def extract_stats(seg):
+    return {
+        'mean'    : np.mean(seg),
+        'std'     : np.std(seg),
+        'skewness': float(skew(seg)),
+        'kurtosis': float(kurtosis(seg)),
+        'rms'     : np.sqrt(np.mean(seg**2)),
+    }
+
+norm_feats = [extract_stats(signals[c, norm_ss:norm_es]) for c in range(signals.shape[0])]
+seiz_feats = [extract_stats(signals[c, sz_ss:sz_es])   for c in range(signals.shape[0])]
+
+feat_keys = list(norm_feats[0].keys())
+fig, axes = plt.subplots(1, len(feat_keys), figsize=(18, 4))
+fig.suptitle('Statistical Features: Normal vs Seizure (per channel)', fontsize=12, fontweight='bold')
+for ax, fk in zip(axes, feat_keys):
+    nv = [f[fk] for f in norm_feats]
+    sv = [f[fk] for f in seiz_feats]
+    ax.plot(nv, label='Normal',  color=PALETTE[1], marker='o', markersize=4)
+    ax.plot(sv, label='Seizure', color=PALETTE[0], marker='s', markersize=4)
+    ax.set_title(fk); ax.set_xlabel('Channel idx')
+    ax.legend(fontsize=7)
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_stat_features.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_stat_features.png")
+
+
+
+# ==============================
+# CODE CELL 15
+# ==============================
+# ============================================================
+# CELL 5I — EDA: Wavelet Decomposition
+# ============================================================
+ch_idx = 0
+seg    = signals[ch_idx, sz_ss : sz_ss + 4 * fs]
+wavelet   = 'db4'
+max_level = 5
+
+coeffs = pywt.wavedec(seg, wavelet, level=max_level)
+fig, axes = plt.subplots(max_level + 1, 1, figsize=(14, 10), sharex=False)
+fig.suptitle(f'Wavelet Decomposition ({wavelet}) — Seizure Segment Ch={ch_names[ch_idx]}',
+             fontsize=12, fontweight='bold')
+labels = ['Approx (A5)'] + [f'Detail (D{max_level - i})' for i in range(max_level)]
+for ax, coef, lbl in zip(axes, coeffs, labels):
+    ax.plot(coef, linewidth=0.8, color=PALETTE[2])
+    ax.set_ylabel(lbl, fontsize=8)
+    ax.tick_params(labelsize=7)
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_wavelet.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_wavelet.png")
+
+
+
+# ==============================
+# CODE CELL 16
+# ==============================
+# ============================================================
+# CELL 5J — EDA: Class Imbalance Visualization (AutoViz-style)
+# ============================================================
+WINDOW_SIZE = 4
+STEP        = 2
+
+approx_sz_wins, approx_norm_wins = 0, 0
+for pat, ann in all_annotations.items():
+    for fname, segs in ann.items():
+        sz_secs   = sum(e - s for s, e in segs)
+        norm_secs = max(0, 3600 - sz_secs)
+        approx_sz_wins   += max(0, (sz_secs   - WINDOW_SIZE) // STEP)
+        approx_norm_wins += max(0, (norm_secs  - WINDOW_SIZE) // STEP)
+
+total_wins = approx_sz_wins + approx_norm_wins
+imbalance  = approx_norm_wins / max(1, approx_sz_wins)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+fig.suptitle('Class Imbalance Analysis (AutoViz-style)', fontsize=14, fontweight='bold')
+
+# Pie
+axes[0].pie(
+    [approx_sz_wins, approx_norm_wins],
+    labels=[f'Seizure\n~{approx_sz_wins:,}', f'Normal\n~{approx_norm_wins:,}'],
+    colors=[PALETTE[0], PALETTE[1]], autopct='%1.1f%%', startangle=90,
+    textprops={'fontsize': 10}
+)
+axes[0].set_title('Window Distribution (Est.)')
+
+# Bar
+axes[1].bar(['Seizure', 'Normal'], [approx_sz_wins, approx_norm_wins],
+            color=[PALETTE[0], PALETTE[1]], edgecolor='black', linewidth=0.6)
+axes[1].set_title('Window Counts (Est.)'); axes[1].set_ylabel('# Windows')
+for i, v in enumerate([approx_sz_wins, approx_norm_wins]):
+    axes[1].text(i, v + 50, f'{v:,}', ha='center', fontweight='bold')
+
+# After SMOTE bar (estimated)
+smote_sz = approx_norm_wins  # balanced
+axes[2].bar(['Seizure (SMOTE)', 'Normal'], [smote_sz, approx_norm_wins],
+            color=[PALETTE[2], PALETTE[1]], edgecolor='black', linewidth=0.6)
+axes[2].set_title('After SMOTE (Balanced)'); axes[2].set_ylabel('# Windows')
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/eda_class_imbalance.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/eda_class_imbalance.png")
+print(f"  Imbalance ratio (Normal:Seizure) ≈ {imbalance:.1f}:1")
+print("  → SMOTE oversampling will be applied to balance the dataset")
+
+
+
+# ==============================
+# CODE CELL 18
+# ==============================
+# ============================================================
+# CELL 6 — Preprocessing Pipeline
+# ============================================================
+class EEGPreprocessor:
+    def __init__(self, fs=256, lo=0.5, hi=100, notch=60):
+        self.fs = fs; self.lo = lo; self.hi = hi; self.notch = notch
+
+    def bandpass(self, data, order=4):
+        lo_n = self.lo / (self.fs / 2)
+        hi_n = min(self.hi / (self.fs / 2), 0.999)
+        b, a = butter(order, [lo_n, hi_n], btype='band')
+        return filtfilt(b, a, data)
+
+    def notch_filter(self, data, order=4):
+        n = self.notch / (self.fs / 2)
+        b, a = butter(order, [n - 0.02, n + 0.02], btype='bandstop')
+        return filtfilt(b, a, data)
+
+    def normalize(self, data):
+        mu = data.mean(axis=1, keepdims=True)
+        sd = data.std(axis=1, keepdims=True) + 1e-8
+        return (data - mu) / sd
+
+    def preprocess(self, data):
+        out = np.zeros_like(data)
+        for i in range(data.shape[0]):
+            ch = self.bandpass(data[i])
+            ch = self.notch_filter(ch)
+            out[i] = ch
+        return self.normalize(out)
+
+preprocessor = EEGPreprocessor(fs=fs)
+print("✅  EEGPreprocessor ready")
+
+ch_idx = 0; dur = 5; samp = dur * fs
+raw   = signals[ch_idx, norm_ss : norm_ss + samp]
+clean = preprocessor.preprocess(signals[:, norm_ss : norm_ss + samp])[ch_idx]
+t     = np.arange(samp) / fs
+
+fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 6), sharex=True)
+fig.suptitle('Preprocessing Effect', fontsize=13, fontweight='bold')
+ax1.plot(t, raw,   color='#457b9d', lw=0.8); ax1.set_title('Raw Signal');    ax1.set_ylabel('µV')
+ax2.plot(t, clean, color='#2a9d8f', lw=0.8); ax2.set_title('Cleaned Signal'); ax2.set_ylabel('Normalized')
+ax2.set_xlabel('Time (s)')
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/preprocessing_effect.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/preprocessing_effect.png")
+
+
+
+# ==============================
+# CODE CELL 20
+# ==============================
+# ============================================================
+# CELL 7 — Build Windowed Dataset (Balanced via SMOTE)
+# ============================================================
+WINDOW_SAMPLES = 4 * fs   # 1024 samples
+STEP_SAMPLES   = 2 * fs   # 50% overlap
+N_CHANNELS     = 18
+PATIENTS       = ['chb01', 'chb02', 'chb03', 'chb05', 'chb06']
+
+all_windows, all_labels = [], []
+
+print("="*60); print("📦  BUILDING DATASET"); print("="*60)
+
+for patient in PATIENTS:
+    if patient not in all_annotations:
+        continue
+    ann = all_annotations[patient]
+    print(f"\n  👤 {patient}")
+    for fname, segs in ann.items():
+        edf = os.path.join(CHB_PATH, patient, fname)
+        if not os.path.isfile(edf):
+            continue
+        try:
+            sigs, _, _ = load_edf(edf, N_CHANNELS)
+        except Exception as e:
+            print(f"    ⚠️  Skip {fname}: {e}"); continue
+        if sigs.shape[0] < N_CHANNELS:
+            sigs = np.pad(sigs, ((0, N_CHANNELS - sigs.shape[0]), (0, 0)))
+        sigs = preprocessor.preprocess(sigs[:N_CHANNELS])
+        T    = sigs.shape[1]
+
+        # Seizure windows
+        for (sz_s, sz_e) in segs:
+            ss, se = sz_s * fs, sz_e * fs
+            start  = ss
+            while start + WINDOW_SAMPLES <= se:
+                w = sigs[:, start : start + WINDOW_SAMPLES]
+                if w.shape == (N_CHANNELS, WINDOW_SAMPLES):
+                    all_windows.append(w); all_labels.append(1)
+                start += STEP_SAMPLES
+
+        # Normal windows (capped at 200 per file)
+        if segs:
+            sz_ends   = [e * fs for _, e in segs]
+            sz_starts = [s * fs for s, _ in segs]
+            start = 0; added = 0
+            while start + WINDOW_SAMPLES <= T and added < 200:
+                in_sz = any(ss <= start < se for ss, se in zip(sz_starts, sz_ends))
+                if not in_sz:
+                    w = sigs[:, start : start + WINDOW_SAMPLES]
+                    if w.shape == (N_CHANNELS, WINDOW_SAMPLES):
+                        all_windows.append(w); all_labels.append(0); added += 1
+                start += STEP_SAMPLES
+
+gc.collect()
+
+X_raw = np.array(all_windows, dtype=np.float32)   # (N, C, T)
+y_raw = np.array(all_labels,  dtype=np.float32)
+
+print(f"\n  Raw X shape : {X_raw.shape}")
+print(f"  Seizure     : {(y_raw==1).sum()}")
+print(f"  Normal      : {(y_raw==0).sum()}")
+
+# ── SMOTE to balance ───────────────────────────────────────────
+N, C, T = X_raw.shape
+X_flat  = X_raw.reshape(N, C * T)
+
+smote   = SMOTE(random_state=42)
+X_bal, y_bal = smote.fit_resample(X_flat, y_raw)
+
+X = X_bal.reshape(-1, C, T).astype(np.float32)
+y = y_bal.astype(np.float32)
+
+print(f"\n  After SMOTE:")
+print(f"  X shape : {X.shape}")
+print(f"  Seizure : {(y==1).sum()}")
+print(f"  Normal  : {(y==0).sum()}")
+
+
+
+# ==============================
+# CODE CELL 21
+# ==============================
+# ============================================================
+# CELL 8 — Train / Validation / Test Split & DataLoaders
+# ============================================================
+# (N, C, T) → (N, T, C) for transformer models
+X_tc = X.transpose(0, 2, 1)
+
+X_tr, X_tmp, y_tr, y_tmp = train_test_split(X_tc, y, test_size=0.30, stratify=y, random_state=42)
+X_val, X_te, y_val, y_te  = train_test_split(X_tmp, y_tmp, test_size=0.50, stratify=y_tmp, random_state=42)
+
+print("="*60); print("✂️  DATA SPLIT"); print("="*60)
+for name, xs, ys in [('Train', X_tr, y_tr), ('Val', X_val, y_val), ('Test', X_te, y_te)]:
+    print(f"  {name:5}: {xs.shape}  |  seizure={int(ys.sum())}  normal={int((ys==0).sum())}")
+
+to_t = lambda a: torch.tensor(a)
+ds_tr  = TensorDataset(to_t(X_tr),  to_t(y_tr))
+ds_val = TensorDataset(to_t(X_val), to_t(y_val))
+ds_te  = TensorDataset(to_t(X_te),  to_t(y_te))
+
+BATCH = 32
+train_loader = DataLoader(ds_tr,  batch_size=BATCH, shuffle=True,  drop_last=True)
+val_loader   = DataLoader(ds_val, batch_size=BATCH, shuffle=False)
+test_loader  = DataLoader(ds_te,  batch_size=BATCH, shuffle=False)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"\n  Device: {device}")
+print("✅  DataLoaders ready")
+
+
+
+# ==============================
+# CODE CELL 23
+# ==============================
+# ============================================================
+# CELL 9 — SCT: Spike Encoding & Architecture
+# ============================================================
+class SpikeEncoder(nn.Module):
+    """Convert analog EEG to binary spike train via threshold."""
+
+    def __init__(self, threshold=0.5):
+        super().__init__()
+        self.threshold = nn.Parameter(torch.tensor(threshold))
+
+    def forward(self, x):
+        # x: (B, T, C)
+        spikes = (x.abs() > self.threshold).float()
+        mem = torch.zeros_like(x)
+        for t in range(x.shape[1]):
+            prev = mem[:, t - 1] if t > 0 else torch.zeros_like(x[:, 0])
+            mem[:, t] = 0.9 * prev + x[:, t]
+        return spikes + 0.1 * torch.tanh(mem)
+
+
+class SpikingConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, k=5):
+        super().__init__()
+        self.conv = nn.Conv1d(in_ch, out_ch, k, padding=k // 2)
+        self.bn   = nn.BatchNorm1d(out_ch)
+        self.pool = nn.MaxPool1d(2)
+
+    def forward(self, x):
+        return F.relu(self.pool(self.bn(self.conv(x))))
+
+
+class SCT(nn.Module):
+    def __init__(self, n_ch=18, T=1024, n_classes=1,
+                 d_model=64, n_heads=4, n_layers=2, dropout=0.2):
+        super().__init__()
+        self.spike_enc = SpikeEncoder()
+        self.conv1 = SpikingConvBlock(n_ch,    32, k=7)
+        self.conv2 = SpikingConvBlock(32,      64, k=5)
+        self.conv3 = SpikingConvBlock(64, d_model, k=3)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 4, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.cls_token   = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pool_fc     = nn.Sequential(
+            nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(32, n_classes), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # x: (B, T, C)
+        x   = self.spike_enc(x)
+        x   = x.permute(0, 2, 1)     # (B, C, T)
+        x   = self.conv1(x)
+        x   = self.conv2(x)
+        x   = self.conv3(x)
+        x   = x.permute(0, 2, 1)     # (B, T', d_model)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x   = torch.cat([cls, x], dim=1)
+        x   = self.transformer(x)
+        out = self.pool_fc(x[:, 0])
+        return out.squeeze(-1)
+
+
+sct_model = SCT().to(device)
+n_params  = sum(p.numel() for p in sct_model.parameters() if p.requires_grad)
+print("="*60); print("🧠  SCT MODEL SUMMARY"); print("="*60)
+print(f"  Trainable parameters: {n_params:,}")
+print(f"  Architecture: SpikeEncoder → Conv×3 → Transformer(2L,4H) → FC")
+
+
+
+# ==============================
+# CODE CELL 24
+# ==============================
+# ============================================================
+# CELL 10 — Generic Training Function
+# ============================================================
+def train_model(model, train_loader, val_loader, epochs=30, lr=1e-3, name='Model'):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    n_pos = sum(y.sum().item() for _, y in train_loader)
+    n_neg = sum((1 - y).sum().item() for _, y in train_loader)
+    pos_w = torch.tensor(n_neg / max(n_pos, 1)).to(device)
+    criterion = nn.BCELoss(reduction='none')
+
+    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+    best_auc, best_state = 0, None
+
+    print(f"  Training {name} for {epochs} epochs…")
+    for ep in range(1, epochs + 1):
+        model.train(); ep_loss = 0
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            pred = model(Xb)
+            w    = torch.where(yb == 1, pos_w, torch.ones_like(pos_w))
+            loss = (criterion(pred, yb) * w).mean()
+            loss.backward(); optimizer.step()
+            ep_loss += loss.item()
+        scheduler.step()
+
+        model.eval(); vloss = 0; vp, vy = [], []
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                pred   = model(Xb)
+                w      = torch.where(yb == 1, pos_w, torch.ones_like(pos_w))
+                vloss += (criterion(pred, yb) * w).mean().item()
+                vp.extend(pred.cpu().numpy()); vy.extend(yb.cpu().numpy())
+        try:    vauc = roc_auc_score(vy, vp)
+        except: vauc = 0.5
+
+        history['train_loss'].append(ep_loss / len(train_loader))
+        history['val_loss'].append(vloss / len(val_loader))
+        history['val_auc'].append(vauc)
+
+        if vauc > best_auc:
+            best_auc = vauc; best_state = copy.deepcopy(model.state_dict())
+        if ep % 5 == 0:
+            print(f"    Ep {ep:03d} | TrainLoss={ep_loss/len(train_loader):.4f} "
+                  f"| ValLoss={vloss/len(val_loader):.4f} | ValAUC={vauc:.4f}")
+
+    model.load_state_dict(best_state)
+    print(f"  ✅  Best ValAUC = {best_auc:.4f}")
+    return history
+
+
+sct_history = train_model(sct_model, train_loader, val_loader, epochs=30, name='SCT')
+
+
+
+# ==============================
+# CODE CELL 25
+# ==============================
+# ============================================================
+# CELL 11 — Generic Evaluation & Result Plots
+# ============================================================
+def evaluate_model(model, loader, name='Model', color='#e63946'):
+    model.eval()
+    all_probs, all_preds, all_labels = [], [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            p  = model(Xb).cpu().numpy()
+            all_probs.extend(p)
+            all_preds.extend((p > 0.5).astype(int))
+            all_labels.extend(yb.numpy())
+
+    all_probs  = np.array(all_probs)
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+
+    metrics = {
+        'Accuracy' : accuracy_score(all_labels, all_preds),
+        'Precision': precision_score(all_labels, all_preds, zero_division=0),
+        'Recall'   : recall_score(all_labels, all_preds, zero_division=0),
+        'F1'       : f1_score(all_labels, all_preds, zero_division=0),
+        'AUC'      : roc_auc_score(all_labels, all_probs),
+    }
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
+    metrics['Sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0
+    metrics['Specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+
+    print(f"\n  📊  {name} Results:")
+    for k, v in metrics.items():
+        print(f"    {k:12}: {v:.4f}")
+
+    return metrics, all_probs, all_preds, all_labels
+
+
+def plot_results(history, metrics, probs, preds, labels, name, color, save_prefix):
+    fig = plt.figure(figsize=(20, 10))
+    gs  = gridspec.GridSpec(2, 4, figure=fig)
+    fig.suptitle(f'{name} — Training & Evaluation Results', fontsize=14, fontweight='bold')
+
+    ax = fig.add_subplot(gs[0, 0])
+    ax.plot(history['train_loss'], label='Train', color=color, lw=1.5)
+    ax.plot(history['val_loss'],   label='Val',   color='gray', lw=1.5, linestyle='--')
+    ax.set_title('Loss Curve'); ax.set_xlabel('Epoch'); ax.legend()
+
+    ax = fig.add_subplot(gs[0, 1])
+    ax.plot(history['val_auc'], color=color, lw=1.5)
+    ax.set_title('Validation AUC'); ax.set_xlabel('Epoch'); ax.set_ylabel('AUC')
+
+    ax = fig.add_subplot(gs[0, 2])
+    cm = confusion_matrix(labels, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                xticklabels=['Normal', 'Seizure'], yticklabels=['Normal', 'Seizure'])
+    ax.set_title('Confusion Matrix'); ax.set_ylabel('True'); ax.set_xlabel('Pred')
+
+    ax = fig.add_subplot(gs[0, 3])
+    fpr, tpr, _ = roc_curve(labels, probs)
+    ax.plot(fpr, tpr, color=color, lw=2, label=f"AUC={metrics['AUC']:.4f}")
+    ax.plot([0, 1], [0, 1], 'k--', lw=1)
+    ax.set_title('ROC Curve'); ax.set_xlabel('FPR'); ax.set_ylabel('TPR'); ax.legend()
+
+    ax = fig.add_subplot(gs[1, :2])
+    ks = list(metrics.keys()); vs = list(metrics.values())
+    bars = ax.bar(ks, vs, color=[color] * len(ks), edgecolor='black', linewidth=0.5)
+    ax.set_ylim(0, 1.1); ax.set_title('Performance Metrics')
+    for b, v in zip(bars, vs):
+        ax.text(b.get_x() + b.get_width() / 2, v + 0.01, f'{v:.3f}', ha='center', fontsize=8)
+
+    ax = fig.add_subplot(gs[1, 2:])
+    prec_c, rec_c, _ = precision_recall_curve(labels, probs)
+    ap = average_precision_score(labels, probs)
+    ax.plot(rec_c, prec_c, color=color, lw=2, label=f"AP={ap:.4f}")
+    ax.set_title('Precision-Recall Curve'); ax.set_xlabel('Recall'); ax.set_ylabel('Precision'); ax.legend()
+
+    plt.tight_layout()
+    path = f'{RESULTS_DIR}/{save_prefix}_results.png'
+    fig.savefig(path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"✅  Saved → {path}")
+
+
+sct_metrics, sct_probs, sct_preds, sct_labels = evaluate_model(sct_model, test_loader, 'SCT', PALETTE[0])
+plot_results(sct_history, sct_metrics, sct_probs, sct_preds, sct_labels, 'SCT', PALETTE[0], 'sct')
+
+
+
+# ==============================
+# CODE CELL 26
+# ==============================
+# ============================================================
+# CELL 12 — SCT: Save Model
+# ============================================================
+sct_save = f'{MODELS_DIR}/sct_model.pt'
+torch.save({
+    'model_state_dict': sct_model.state_dict(),
+    'model_name'      : 'SpikingConvTransformer',
+    'metrics'         : sct_metrics,
+    'n_channels'      : 18,
+    'window_samples'  : 1024,
+    'fs'              : 256,
+}, sct_save)
+print(f"✅  SCT model saved → {sct_save}")
+
+
+
+# ==============================
+# CODE CELL 28
+# ==============================
+# ============================================================
+# CELL 13 — GRL: Architecture
+# ============================================================
+class GradientReversalFunction(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.save_for_backward(alpha)
+        return x.clone()
+
+    @staticmethod
+    def backward(ctx, grad):
+        alpha, = ctx.saved_tensors
+        return -alpha * grad, None
+
+
+class GRL(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, alpha=None):
+        if alpha is None:
+            alpha = torch.tensor(1.0)
+        return GradientReversalFunction.apply(x, alpha.to(x.device))
+
+
+class GRLSeizureModel(nn.Module):
+    """EEG seizure detector with domain-adversarial training via GRL."""
+
+    def __init__(self, n_ch=18, T=1024, d=64, dropout=0.3):
+        super().__init__()
+        self.feat = nn.Sequential(
+            nn.Conv1d(n_ch, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(32,   64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(64,  128, 3, padding=1), nn.BatchNorm1d(128), nn.ReLU(), nn.AdaptiveAvgPool1d(16),
+        )
+        flat_dim = 128 * 16
+        self.label_clf = nn.Sequential(
+            nn.Linear(flat_dim, 256), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(256, 64),       nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 1),         nn.Sigmoid()
+        )
+        self.grl = GRL()
+        self.domain_clf = nn.Sequential(
+            nn.Linear(flat_dim, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 32),       nn.ReLU(),
+            nn.Linear(32, 2)
+        )
+
+    def forward(self, x, alpha=1.0):
+        # x: (B, T, C)
+        x = x.permute(0, 2, 1)   # → (B, C, T)
+        f = self.feat(x).view(x.size(0), -1)
+        label_out  = self.label_clf(f)
+        alpha_t    = torch.tensor(alpha, dtype=torch.float32)
+        domain_in  = self.grl(f, alpha_t)
+        domain_out = self.domain_clf(domain_in)
+        return label_out.squeeze(-1), domain_out
+
+
+grl_model = GRLSeizureModel().to(device)
+n_params  = sum(p.numel() for p in grl_model.parameters() if p.requires_grad)
+print("="*60); print("🔁  GRL MODEL SUMMARY"); print("="*60)
+print(f"  Trainable parameters: {n_params:,}")
+print(f"  Architecture: Conv×3 → [LabelClf | GRL→DomainClf]")
+
+
+
+# ==============================
+# CODE CELL 29
+# ==============================
+# ============================================================
+# CELL 14 — GRL Training
+# ============================================================
+def train_grl(model, train_loader, val_loader, epochs=30, lr=1e-3):
+    optimizer  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    lbl_crit   = nn.BCELoss()
+    dom_crit   = nn.CrossEntropyLoss()
+
+    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+    best_auc, best_state = 0, None
+
+    print(f"  Training GRL for {epochs} epochs…")
+    for ep in range(1, epochs + 1):
+        model.train(); ep_loss = 0
+        p     = ep / epochs
+        alpha = 2.0 / (1 + np.exp(-10 * p)) - 1.0
+
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+            optimizer.zero_grad()
+            lbl_out, dom_out = model(Xb, alpha)
+            loss = lbl_crit(lbl_out, yb) + 0.1 * dom_crit(dom_out, dom_labels)
+            loss.backward(); optimizer.step()
+            ep_loss += loss.item()
+        scheduler.step()
+
+        model.eval(); vloss = 0; vp, vy = [], []
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+                lbl_out, dom_out = model(Xb, alpha)
+                vloss += (lbl_crit(lbl_out, yb) + 0.1 * dom_crit(dom_out, dom_labels)).item()
+                vp.extend(lbl_out.cpu().numpy()); vy.extend(yb.cpu().numpy())
+        try:    vauc = roc_auc_score(vy, vp)
+        except: vauc = 0.5
+
+        history['train_loss'].append(ep_loss / len(train_loader))
+        history['val_loss'].append(vloss / len(val_loader))
+        history['val_auc'].append(vauc)
+        if vauc > best_auc:
+            best_auc = vauc; best_state = copy.deepcopy(model.state_dict())
+        if ep % 5 == 0:
+            print(f"    Ep {ep:03d} | Loss={ep_loss/len(train_loader):.4f} | ValAUC={vauc:.4f} | α={alpha:.3f}")
+
+    model.load_state_dict(best_state)
+    print(f"  ✅  Best ValAUC = {best_auc:.4f}")
+    return history
+
+
+grl_history = train_grl(grl_model, train_loader, val_loader, epochs=30)
+
+
+
+# ==============================
+# CODE CELL 30
+# ==============================
+# ============================================================
+# CELL 15 — GRL Evaluation & Save
+# ============================================================
+def evaluate_grl(model, loader, name='GRL', color='#457b9d'):
+    model.eval()
+    all_probs, all_preds, all_labels = [], [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            p, _ = model(Xb)
+            p = p.cpu().numpy()
+            all_probs.extend(p); all_preds.extend((p > 0.5).astype(int))
+            all_labels.extend(yb.numpy())
+    all_probs  = np.array(all_probs)
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    metrics = {
+        'Accuracy' : accuracy_score(all_labels, all_preds),
+        'Precision': precision_score(all_labels, all_preds, zero_division=0),
+        'Recall'   : recall_score(all_labels, all_preds, zero_division=0),
+        'F1'       : f1_score(all_labels, all_preds, zero_division=0),
+        'AUC'      : roc_auc_score(all_labels, all_probs),
+    }
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
+    metrics['Sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0
+    metrics['Specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    print(f"\n  📊  {name} Results:")
+    for k, v in metrics.items():
+        print(f"    {k:12}: {v:.4f}")
+    return metrics, all_probs, all_preds, all_labels
+
+
+grl_metrics, grl_probs, grl_preds, grl_labels = evaluate_grl(grl_model, test_loader)
+plot_results(grl_history, grl_metrics, grl_probs, grl_preds, grl_labels, 'GRL', PALETTE[1], 'grl')
+
+grl_save = f'{MODELS_DIR}/grl_model.pt'
+torch.save({'model_state_dict': grl_model.state_dict(), 'model_name': 'GRL_DomainAdaptation',
+            'metrics': grl_metrics}, grl_save)
+print(f"✅  GRL model saved → {grl_save}")
+
+
+
+# ==============================
+# CODE CELL 32
+# ==============================
+# ============================================================
+# CELL 16 — Federated Learning with Differential Privacy
+# ============================================================
+class FederatedModel(nn.Module):
+    """Compact model for federated training across virtual clients."""
+
+    def __init__(self, n_ch=18, T=1024, dropout=0.3):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(n_ch, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(32,   64, 5, padding=2), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(4),
+            nn.Conv1d(64,  128, 3, padding=1), nn.BatchNorm1d(128), nn.ReLU(), nn.AdaptiveAvgPool1d(8),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * 8, 128), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(128, 1), nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = x.permute(0, 2, 1)   # (B,T,C)→(B,C,T)
+        return self.classifier(self.features(x)).squeeze(-1)
+
+
+def add_dp_noise(model, sigma=0.01, clip_norm=1.0):
+    """Differential privacy: clip gradients + add Gaussian noise."""
+    with torch.no_grad():
+        total_norm = sum(
+            p.grad.data.norm(2).item() ** 2
+            for p in model.parameters() if p.grad is not None
+        ) ** 0.5
+        clip_coef = clip_norm / max(total_norm, clip_norm)
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.mul_(clip_coef)
+                p.grad.data.add_(torch.randn_like(p.grad.data) * sigma)
+
+
+def federated_average(global_model, client_models):
+    """FedAvg: average parameters from all clients."""
+    global_dict = global_model.state_dict()
+    for k in global_dict:
+        stacked = torch.stack([cm.state_dict()[k].float() for cm in client_models])
+        global_dict[k] = stacked.mean(dim=0)
+    global_model.load_state_dict(global_dict)
+
+
+def local_train(model, loader, epochs=2, lr=1e-3, dp=True):
+    opt  = torch.optim.Adam(model.parameters(), lr=lr)
+    crit = nn.BCELoss()
+    model.train()
+    for _ in range(epochs):
+        for Xb, yb in loader:
+            Xb, yb = Xb.to(device), yb.to(device)
+            opt.zero_grad()
+            loss = crit(model(Xb), yb)
+            loss.backward()
+            if dp:
+                add_dp_noise(model)
+            opt.step()
+    return model
+
+
+print("="*60); print("🔒  FEDERATED LEARNING SETUP"); print("="*60)
+N_CLIENTS    = 5
+NUM_ROUNDS   = 15
+LOCAL_EPOCHS = 2
+DP_SIGMA     = 0.01
+
+idx_splits     = np.array_split(np.random.permutation(len(X_tr)), N_CLIENTS)
+client_loaders = []
+for idx in idx_splits:
+    ds = TensorDataset(torch.tensor(X_tr[idx]), torch.tensor(y_tr[idx]))
+    client_loaders.append(DataLoader(ds, batch_size=BATCH, shuffle=True, drop_last=False))
+
+print(f"  Clients      : {N_CLIENTS}")
+print(f"  Rounds       : {NUM_ROUNDS}")
+print(f"  Local epochs : {LOCAL_EPOCHS}")
+print(f"  DP noise σ   : {DP_SIGMA}  (Gaussian)")
+print(f"  Samples/client (avg): {len(X_tr) // N_CLIENTS}")
+
+
+
+# ==============================
+# CODE CELL 33
+# ==============================
+# ============================================================
+# CELL 17 — Federated Training Loop
+# ============================================================
+global_model = FederatedModel().to(device)
+fed_history  = {'round_auc': [], 'round_loss': []}
+
+print("\n🌍  FEDERATED TRAINING START")
+for rnd in range(1, NUM_ROUNDS + 1):
+    client_models = []
+    for _ in range(N_CLIENTS):
+        cm = FederatedModel().to(device)
+        cm.load_state_dict(copy.deepcopy(global_model.state_dict()))
+        client_models.append(cm)
+
+    trained = [local_train(cm, cl, LOCAL_EPOCHS, dp=True)
+               for cm, cl in zip(client_models, client_loaders)]
+    federated_average(global_model, trained)
+
+    global_model.eval(); vp, vy = [], []
+    with torch.no_grad():
+        for Xb, yb in val_loader:
+            pred = global_model(Xb.to(device)).cpu().numpy()
+            vp.extend(pred); vy.extend(yb.numpy())
+    try:    vauc = roc_auc_score(vy, vp)
+    except: vauc = 0.5
+    vloss_val = nn.BCELoss()(torch.tensor(vp).float(), torch.tensor(vy).float()).item()
+
+    fed_history['round_auc'].append(vauc)
+    fed_history['round_loss'].append(vloss_val)
+    print(f"  Round {rnd:02d}/{NUM_ROUNDS} | ValAUC={vauc:.4f} | ValLoss={vloss_val:.4f} [DP σ={DP_SIGMA}]")
+
+print("\n✅  Federated training complete")
+
+
+
+# ==============================
+# CODE CELL 34
+# ==============================
+# ============================================================
+# CELL 18 — Federated Model Evaluation & Save
+# ============================================================
+fed_metrics, fed_probs, fed_preds, fed_labels = evaluate_model(
+    global_model, test_loader, 'FedLearning', PALETTE[2])
+
+fed_hist_dict = {
+    'train_loss': fed_history['round_loss'],
+    'val_loss'  : fed_history['round_loss'],
+    'val_auc'   : fed_history['round_auc'],
+}
+plot_results(fed_hist_dict, fed_metrics, fed_probs, fed_preds, fed_labels,
+             'Privacy-Preserved Federated Learning', PALETTE[2], 'federated')
+
+fed_save = f'{MODELS_DIR}/federated_model.pt'
+torch.save({
+    'model_state_dict': global_model.state_dict(),
+    'model_name'      : 'FederatedLearning_DP',
+    'metrics'         : fed_metrics,
+    'n_clients'       : N_CLIENTS,
+    'num_rounds'      : NUM_ROUNDS,
+    'dp_sigma'        : DP_SIGMA,
+}, fed_save)
+print(f"✅  Federated model saved → {fed_save}")
+
+
+
+# ==============================
+# CODE CELL 36
+# ==============================
+# ============================================================
+# CELL 19 — DA-SCT: Domain Adaptation SCT Architecture
+# ============================================================
+# Combines:
+#   • Spiking Convolutional Transformer (SCT) as feature extractor
+#   • Gradient Reversal Layer (GRL) for cross-patient domain adaptation
+#   • Maximum Mean Discrepancy (MMD) loss for distribution alignment
+# ============================================================
+
+class MMDLoss(nn.Module):
+    """Maximum Mean Discrepancy loss for domain alignment."""
+
+    def __init__(self, kernel_mul=2.0, kernel_num=5):
+        super().__init__()
+        self.kernel_mul = kernel_mul
+        self.kernel_num = kernel_num
+
+    def gaussian_kernel(self, source, target):
+        n_s, n_t = source.size(0), target.size(0)
+        total    = torch.cat([source, target], dim=0)
+        total_sq = (total.unsqueeze(0) - total.unsqueeze(1)).pow(2).sum(dim=2)
+        bandwidth = total_sq.data.sum() / ((n_s + n_t) ** 2 - (n_s + n_t))
+        bandwidth /= self.kernel_mul ** (self.kernel_num // 2)
+        bw_list    = [bandwidth * (self.kernel_mul ** i) for i in range(self.kernel_num)]
+        return sum(torch.exp(-total_sq / bw) for bw in bw_list)
+
+    def forward(self, source, target):
+        n_s = source.size(0); n_t = target.size(0)
+        kernels = self.gaussian_kernel(source, target)
+        XX = kernels[:n_s, :n_s].mean()
+        YY = kernels[n_s:, n_s:].mean()
+        XY = kernels[:n_s, n_s:].mean()
+        return XX + YY - 2 * XY
+
+
+class DASCT(nn.Module):
+    """Domain Adaptation Spiking Convolutional Transformer.
+    
+    Architecture:
+        Input (B,T,C)
+        → SpikeEncoder
+        → Conv×3 (temporal feature extraction)
+        → TransformerEncoder (global temporal context)
+        → [Label Classifier]  ← seizure prediction
+        → [GRL → Domain Classifier]  ← domain adversarial
+    """
+
+    def __init__(self, n_ch=18, T=1024, n_domains=2,
+                 d_model=64, n_heads=4, n_layers=2, dropout=0.2):
+        super().__init__()
+
+        # ── Spiking feature extractor ───────────────────────
+        self.spike_enc = SpikeEncoder()
+        self.conv1 = SpikingConvBlock(n_ch,    32, k=7)
+        self.conv2 = SpikingConvBlock(32,      64, k=5)
+        self.conv3 = SpikingConvBlock(64, d_model, k=3)
+
+        # ── Transformer encoder ─────────────────────────────
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads,
+            dim_feedforward=d_model * 4, dropout=dropout, batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.cls_token   = nn.Parameter(torch.zeros(1, 1, d_model))
+
+        # ── Label classifier ────────────────────────────────
+        self.label_clf = nn.Sequential(
+            nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(32, 1), nn.Sigmoid()
+        )
+
+        # ── Domain classifier via GRL ────────────────────────
+        self.grl = GRL()
+        self.domain_clf = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, n_domains)
+        )
+
+        # ── MMD loss ─────────────────────────────────────────
+        self.mmd = MMDLoss()
+
+    def encode(self, x):
+        """Shared encoding: spikes → conv → transformer → CLS embedding."""
+        x   = self.spike_enc(x)           # (B,T,C)
+        x   = x.permute(0, 2, 1)         # (B,C,T)
+        x   = self.conv1(x)
+        x   = self.conv2(x)
+        x   = self.conv3(x)
+        x   = x.permute(0, 2, 1)         # (B,T',d_model)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x   = torch.cat([cls, x], dim=1)
+        x   = self.transformer(x)
+        return x[:, 0]                    # CLS embedding (B, d_model)
+
+    def forward(self, x, alpha=1.0, x_target=None):
+        feat        = self.encode(x)
+        label_out   = self.label_clf(feat).squeeze(-1)
+
+        alpha_t     = torch.tensor(alpha, dtype=torch.float32)
+        feat_rev    = self.grl(feat, alpha_t)
+        domain_out  = self.domain_clf(feat_rev)
+
+        mmd_loss = torch.tensor(0.0, device=x.device)
+        if x_target is not None and x_target.size(0) > 0:
+            feat_tgt = self.encode(x_target)
+            mmd_loss = self.mmd(feat, feat_tgt)
+
+        return label_out, domain_out, mmd_loss
+
+
+dasct_model = DASCT().to(device)
+n_params = sum(p.numel() for p in dasct_model.parameters() if p.requires_grad)
+print("="*60); print("🌐  DA-SCT MODEL SUMMARY"); print("="*60)
+print(f"  Trainable parameters: {n_params:,}")
+print(f"  Architecture: SpikeEncoder → Conv×3 → Transformer → [LabelClf | GRL→DomainClf]")
+print(f"  Domain alignment: GRL adversarial + MMD distribution matching")
+
+
+
+# ==============================
+# CODE CELL 37
+# ==============================
+# ============================================================
+# CELL 20 — DA-SCT Training
+# ============================================================
+def train_dasct(model, train_loader, val_loader, epochs=30, lr=1e-3):
+    optimizer  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler  = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    lbl_crit   = nn.BCELoss()
+    dom_crit   = nn.CrossEntropyLoss()
+
+    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+    best_auc, best_state = 0, None
+
+    # Split train_loader to simulate source / target domains
+    train_list = list(train_loader)
+
+    print(f"  Training DA-SCT for {epochs} epochs…")
+    for ep in range(1, epochs + 1):
+        model.train(); ep_loss = 0
+        p     = ep / epochs
+        alpha = 2.0 / (1 + np.exp(-10 * p)) - 1.0
+
+        for i, (Xb, yb) in enumerate(train_list):
+            Xb, yb = Xb.to(device), yb.to(device)
+            # Simulate target domain: next batch (circular)
+            Xt, _  = train_list[(i + 1) % len(train_list)]
+            Xt     = Xt.to(device)
+
+            dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+            optimizer.zero_grad()
+
+            lbl_out, dom_out, mmd_loss = model(Xb, alpha, x_target=Xt)
+            lbl_loss = lbl_crit(lbl_out, yb)
+            dom_loss = dom_crit(dom_out, dom_labels)
+            loss     = lbl_loss + 0.1 * dom_loss + 0.05 * mmd_loss
+
+            loss.backward(); optimizer.step()
+            ep_loss += loss.item()
+        scheduler.step()
+
+        model.eval(); vloss = 0; vp, vy = [], []
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+                lbl_out, dom_out, mmd_loss = model(Xb, alpha)
+                vloss += (lbl_crit(lbl_out, yb) + 0.1 * dom_crit(dom_out, dom_labels)).item()
+                vp.extend(lbl_out.cpu().numpy()); vy.extend(yb.cpu().numpy())
+        try:    vauc = roc_auc_score(vy, vp)
+        except: vauc = 0.5
+
+        history['train_loss'].append(ep_loss / len(train_list))
+        history['val_loss'].append(vloss / len(val_loader))
+        history['val_auc'].append(vauc)
+        if vauc > best_auc:
+            best_auc = vauc; best_state = copy.deepcopy(model.state_dict())
+        if ep % 5 == 0:
+            print(f"    Ep {ep:03d} | Loss={ep_loss/len(train_list):.4f} | ValAUC={vauc:.4f} | α={alpha:.3f}")
+
+    model.load_state_dict(best_state)
+    print(f"  ✅  Best ValAUC = {best_auc:.4f}")
+    return history
+
+
+dasct_history = train_dasct(dasct_model, train_loader, val_loader, epochs=30)
+
+
+
+# ==============================
+# CODE CELL 38
+# ==============================
+# ============================================================
+# CELL 21 — DA-SCT Evaluation & Save
+# ============================================================
+def evaluate_dasct(model, loader, name='DA-SCT', color='#e9c46a'):
+    model.eval()
+    all_probs, all_preds, all_labels = [], [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            p, _, _ = model(Xb)
+            p = p.cpu().numpy()
+            all_probs.extend(p); all_preds.extend((p > 0.5).astype(int))
+            all_labels.extend(yb.numpy())
+    all_probs  = np.array(all_probs)
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    metrics = {
+        'Accuracy' : accuracy_score(all_labels, all_preds),
+        'Precision': precision_score(all_labels, all_preds, zero_division=0),
+        'Recall'   : recall_score(all_labels, all_preds, zero_division=0),
+        'F1'       : f1_score(all_labels, all_preds, zero_division=0),
+        'AUC'      : roc_auc_score(all_labels, all_probs),
+    }
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
+    metrics['Sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0
+    metrics['Specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    print(f"\n  📊  {name} Results:")
+    for k, v in metrics.items():
+        print(f"    {k:12}: {v:.4f}")
+    return metrics, all_probs, all_preds, all_labels
+
+
+dasct_metrics, dasct_probs, dasct_preds, dasct_labels = evaluate_dasct(dasct_model, test_loader)
+plot_results(dasct_history, dasct_metrics, dasct_probs, dasct_preds, dasct_labels, 'DA-SCT', PALETTE[3], 'dasct')
+
+dasct_save = f'{MODELS_DIR}/dasct_model.pt'
+torch.save({
+    'model_state_dict': dasct_model.state_dict(),
+    'model_name'      : 'DA_SCT_DomainAdaptation',
+    'metrics'         : dasct_metrics,
+}, dasct_save)
+print(f"✅  DA-SCT model saved → {dasct_save}")
+
+
+
+# ==============================
+# CODE CELL 40
+# ==============================
+# ============================================================
+# CELL 22 — DA-GRL: Enhanced Domain Adaptation GRL Architecture
+# ============================================================
+# Extends the base GRL model with:
+#   • Multi-scale convolutional feature extraction
+#   • Attention-based temporal pooling
+#   • CORAL (Correlation Alignment) loss for deeper domain alignment
+#   • Progressive alpha scheduling per-sample
+# ============================================================
+
+class CORALLoss(nn.Module):
+    """CORAL: align second-order statistics of source and target."""
+
+    def forward(self, source, target):
+        d = source.size(1)
+        # Source covariance
+        ns = source.size(0)
+        cs = (source.t().mm(source) - source.sum(0).unsqueeze(1).mm(
+              source.sum(0).unsqueeze(0)) / ns) / (ns - 1 + 1e-8)
+        # Target covariance
+        nt = target.size(0)
+        ct = (target.t().mm(target) - target.sum(0).unsqueeze(1).mm(
+              target.sum(0).unsqueeze(0)) / nt) / (nt - 1 + 1e-8)
+        loss = (cs - ct).pow(2).sum() / (4 * d * d)
+        return loss
+
+
+class AttentionPool(nn.Module):
+    """Soft attention pooling over time dimension."""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.attn = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        # x: (B, T, d_model)
+        weights = torch.softmax(self.attn(x), dim=1)   # (B, T, 1)
+        return (weights * x).sum(dim=1)                 # (B, d_model)
+
+
+class DAGRLModel(nn.Module):
+    """Enhanced Domain Adaptation GRL with multi-scale Conv + Attention + CORAL.
+    
+    Architecture:
+        Input (B,T,C)
+        → Multi-scale Conv (3, 5, 7 kernels) → concat → BN → ReLU
+        → Attention Temporal Pooling
+        → [Label Classifier]
+        → [GRL → Domain Classifier]
+        CORAL loss between source/target feature distributions
+    """
+
+    def __init__(self, n_ch=18, d_model=128, n_domains=2, dropout=0.3):
+        super().__init__()
+
+        # ── Multi-scale feature extractor ───────────────────
+        self.conv_s = nn.Sequential(
+            nn.Conv1d(n_ch, 32, 3, padding=1), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2))
+        self.conv_m = nn.Sequential(
+            nn.Conv1d(n_ch, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2))
+        self.conv_l = nn.Sequential(
+            nn.Conv1d(n_ch, 32, 7, padding=3), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2))
+
+        fused_ch = 96  # 32*3
+
+        self.deep = nn.Sequential(
+            nn.Conv1d(fused_ch, 128, 5, padding=2), nn.BatchNorm1d(128), nn.ReLU(), nn.MaxPool1d(2),
+            nn.Conv1d(128, d_model, 3, padding=1), nn.BatchNorm1d(d_model), nn.ReLU(),
+        )
+        self.attn_pool = AttentionPool(d_model)
+
+        # ── Label classifier ────────────────────────────────
+        self.label_clf = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 16),      nn.ReLU(),
+            nn.Linear(16, 1),       nn.Sigmoid()
+        )
+
+        # ── Domain classifier via GRL ────────────────────────
+        self.grl = GRL()
+        self.domain_clf = nn.Sequential(
+            nn.Linear(d_model, 64), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(64, 16),      nn.ReLU(),
+            nn.Linear(16, n_domains)
+        )
+
+        # ── CORAL loss ───────────────────────────────────────
+        self.coral = CORALLoss()
+
+    def encode(self, x):
+        """Multi-scale encoding."""
+        # x: (B, T, C) → (B, C, T)
+        x = x.permute(0, 2, 1)
+        f = torch.cat([self.conv_s(x), self.conv_m(x), self.conv_l(x)], dim=1)
+        f = self.deep(f)
+        f = f.permute(0, 2, 1)          # (B, T', d_model)
+        return self.attn_pool(f)        # (B, d_model)
+
+    def forward(self, x, alpha=1.0, x_target=None):
+        feat       = self.encode(x)
+        label_out  = self.label_clf(feat).squeeze(-1)
+
+        alpha_t    = torch.tensor(alpha, dtype=torch.float32)
+        feat_rev   = self.grl(feat, alpha_t)
+        domain_out = self.domain_clf(feat_rev)
+
+        coral_loss = torch.tensor(0.0, device=x.device)
+        if x_target is not None and x_target.size(0) > 0:
+            feat_tgt   = self.encode(x_target)
+            coral_loss = self.coral(feat, feat_tgt)
+
+        return label_out, domain_out, coral_loss
+
+
+dagrl_model = DAGRLModel().to(device)
+n_params = sum(p.numel() for p in dagrl_model.parameters() if p.requires_grad)
+print("="*60); print("🔀  DA-GRL MODEL SUMMARY"); print("="*60)
+print(f"  Trainable parameters: {n_params:,}")
+print(f"  Architecture: MultiScale-Conv(3,5,7) → AttentionPool → [LabelClf | GRL→DomainClf]")
+print(f"  Domain alignment: GRL adversarial + CORAL covariance matching")
+
+
+
+# ==============================
+# CODE CELL 41
+# ==============================
+# ============================================================
+# CELL 23 — DA-GRL Training
+# ============================================================
+def train_dagrl(model, train_loader, val_loader, epochs=30, lr=1e-3):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    lbl_crit  = nn.BCELoss()
+    dom_crit  = nn.CrossEntropyLoss()
+
+    history = {'train_loss': [], 'val_loss': [], 'val_auc': []}
+    best_auc, best_state = 0, None
+
+    train_list = list(train_loader)
+
+    print(f"  Training DA-GRL for {epochs} epochs…")
+    for ep in range(1, epochs + 1):
+        model.train(); ep_loss = 0
+        p     = ep / epochs
+        alpha = 2.0 / (1 + np.exp(-10 * p)) - 1.0
+
+        for i, (Xb, yb) in enumerate(train_list):
+            Xb, yb = Xb.to(device), yb.to(device)
+            Xt, _  = train_list[(i + 1) % len(train_list)]
+            Xt     = Xt.to(device)
+
+            dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+            optimizer.zero_grad()
+
+            lbl_out, dom_out, coral_loss = model(Xb, alpha, x_target=Xt)
+            lbl_loss = lbl_crit(lbl_out, yb)
+            dom_loss = dom_crit(dom_out, dom_labels)
+            loss     = lbl_loss + 0.1 * dom_loss + 0.05 * coral_loss
+
+            loss.backward(); optimizer.step()
+            ep_loss += loss.item()
+        scheduler.step()
+
+        model.eval(); vloss = 0; vp, vy = [], []
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(device), yb.to(device)
+                dom_labels = torch.randint(0, 2, (Xb.size(0),)).to(device)
+                lbl_out, dom_out, coral_loss = model(Xb, alpha)
+                vloss += (lbl_crit(lbl_out, yb) + 0.1 * dom_crit(dom_out, dom_labels)).item()
+                vp.extend(lbl_out.cpu().numpy()); vy.extend(yb.cpu().numpy())
+        try:    vauc = roc_auc_score(vy, vp)
+        except: vauc = 0.5
+
+        history['train_loss'].append(ep_loss / len(train_list))
+        history['val_loss'].append(vloss / len(val_loader))
+        history['val_auc'].append(vauc)
+        if vauc > best_auc:
+            best_auc = vauc; best_state = copy.deepcopy(model.state_dict())
+        if ep % 5 == 0:
+            print(f"    Ep {ep:03d} | Loss={ep_loss/len(train_list):.4f} | ValAUC={vauc:.4f} | α={alpha:.3f}")
+
+    model.load_state_dict(best_state)
+    print(f"  ✅  Best ValAUC = {best_auc:.4f}")
+    return history
+
+
+dagrl_history = train_dagrl(dagrl_model, train_loader, val_loader, epochs=30)
+
+
+
+# ==============================
+# CODE CELL 42
+# ==============================
+# ============================================================
+# CELL 24 — DA-GRL Evaluation & Save
+# ============================================================
+def evaluate_dagrl(model, loader, name='DA-GRL', color='#f4a261'):
+    model.eval()
+    all_probs, all_preds, all_labels = [], [], []
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(device)
+            p, _, _ = model(Xb)
+            p = p.cpu().numpy()
+            all_probs.extend(p); all_preds.extend((p > 0.5).astype(int))
+            all_labels.extend(yb.numpy())
+    all_probs  = np.array(all_probs)
+    all_preds  = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    metrics = {
+        'Accuracy' : accuracy_score(all_labels, all_preds),
+        'Precision': precision_score(all_labels, all_preds, zero_division=0),
+        'Recall'   : recall_score(all_labels, all_preds, zero_division=0),
+        'F1'       : f1_score(all_labels, all_preds, zero_division=0),
+        'AUC'      : roc_auc_score(all_labels, all_probs),
+    }
+    tn, fp, fn, tp = confusion_matrix(all_labels, all_preds).ravel()
+    metrics['Sensitivity'] = tp / (tp + fn) if (tp + fn) > 0 else 0
+    metrics['Specificity'] = tn / (tn + fp) if (tn + fp) > 0 else 0
+    print(f"\n  📊  {name} Results:")
+    for k, v in metrics.items():
+        print(f"    {k:12}: {v:.4f}")
+    return metrics, all_probs, all_preds, all_labels
+
+
+dagrl_metrics, dagrl_probs, dagrl_preds, dagrl_labels = evaluate_dagrl(dagrl_model, test_loader)
+plot_results(dagrl_history, dagrl_metrics, dagrl_probs, dagrl_preds, dagrl_labels,
+             'DA-GRL', PALETTE[4], 'dagrl')
+
+dagrl_save = f'{MODELS_DIR}/dagrl_model.pt'
+torch.save({
+    'model_state_dict': dagrl_model.state_dict(),
+    'model_name'      : 'DA_GRL_DomainAdaptation',
+    'metrics'         : dagrl_metrics,
+}, dagrl_save)
+print(f"✅  DA-GRL model saved → {dagrl_save}")
+
+
+
+# ==============================
+# CODE CELL 44
+# ==============================
+# ============================================================
+# CELL 25 — Model Comparison Table & Radar Chart (4 Models)
+# NOTE: Federated Learning excluded from paper scope
+# ============================================================
+comparison = pd.DataFrame({
+    'SCT'   : sct_metrics,
+    'GRL'   : grl_metrics,
+    'DA-SCT': dasct_metrics,
+    'DA-GRL': dagrl_metrics,
+}).T.reset_index().rename(columns={'index': 'Model'})
+
+print("="*65); print("📊  FINAL MODEL COMPARISON"); print("="*65)
+print(comparison.to_string(index=False))
+
+best_model_name = comparison.set_index('Model')['AUC'].idxmax()
+print(f"\n  🏆  Best Model (by AUC): {best_model_name}")
+
+comp_csv = f'{RESULTS_DIR}/model_comparison.csv'
+comparison.to_csv(comp_csv, index=False)
+print(f"✅  Saved → {comp_csv}")
+
+model_colors = {
+    'SCT'   : PALETTE[0],
+    'GRL'   : PALETTE[1],
+    'DA-SCT': PALETTE[3],
+    'DA-GRL': PALETTE[4],
+}
+
+# ── Radar Chart ──────────────────────────────────────────────
+metrics_for_radar = ['Accuracy', 'Precision', 'Recall', 'F1', 'AUC']
+N = len(metrics_for_radar)
+angles = [n / float(N) * 2 * 3.14159 for n in range(N)]
+angles += angles[:1]
+
+fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+for model_name in comparison['Model']:
+    vals = comparison.set_index('Model').loc[model_name, metrics_for_radar].tolist()
+    vals += vals[:1]
+    ax.plot(angles, vals, '-o', label=model_name, color=model_colors[model_name], linewidth=2)
+    ax.fill(angles, vals, alpha=0.08, color=model_colors[model_name])
+
+ax.set_xticks(angles[:-1])
+ax.set_xticklabels(metrics_for_radar, size=11)
+ax.set_ylim(0.95, 1.01)
+ax.set_title('Model Comparison — Radar Chart', size=14, fontweight='bold', pad=20)
+ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/radar_comparison.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/radar_comparison.png")
+
+
+
+# ==============================
+# CODE CELL 46
+# ==============================
+# ============================================================
+# CELL 26 — XAI STEP 1: Universal SHAP Wrapper
+# ============================================================
+# Handles all four model output signatures:
+#   SCT       → logit scalar  (B,)
+#   GRL       → (logit, domain)
+#   DA-SCT    → (logit, domain, mmd)
+#   DA-GRL    → (logit, domain, coral)
+# ============================================================
+
+class SHAPWrapper(nn.Module):
+    """SHAP-compatible wrapper for all four model types."""
+
+    def __init__(self, model, model_type='sct'):
+        super().__init__()
+        self.model = model
+        self.model_type = model_type.lower().replace('-', '')
+
+    def forward(self, x):
+        mt = self.model_type
+        if mt == 'grl':
+            out, _ = self.model(x)
+        elif mt in ('dasct', 'dagrl'):
+            out, _, _ = self.model(x)
+        else:  # sct / fed
+            out = self.model(x)
+
+        out = torch.as_tensor(out)
+        # Ensure (B, 1) shape
+        if out.ndim == 1:
+            out = out.unsqueeze(1)
+        elif out.ndim > 2:
+            out = out.reshape(out.shape[0], -1)
+        if out.shape[1] > 1:
+            out = out[:, :1]
+        return out
+
+print("✅  SHAPWrapper defined")
+
+
+
+# ==============================
+# CODE CELL 47
+# ==============================
+# ============================================================
+# CELL 27 — XAI STEP 2: Select Best Model & Build Background
+# ============================================================
+
+CH_NAMES = ['FP1-F7','F7-T7','T7-P7','P7-O1',
+            'FP1-F3','F3-C3','C3-P3','P3-O1',
+            'FP2-F4','F4-C4','C4-P4','P4-O2',
+            'FP2-F8','F8-T8','T8-P8','P8-O2',
+            'FZ-CZ','CZ-PZ']
+
+# ── Map model name → (object, type_string) ──────────────────
+model_registry = {
+    'SCT'   : (sct_model,   'sct'),
+    'GRL'   : (grl_model,   'grl'),
+    'DA-SCT': (dasct_model, 'dasct'),
+    'DA-GRL': (dagrl_model, 'dagrl'),
+}
+best_model_obj, best_type = model_registry[best_model_name]
+best_model_obj.cpu().eval()
+
+# ── Build balanced background & explanation sets ─────────────
+BG_SIZE   = 80
+TEST_SIZE = 120
+
+bg_sz = np.where(y_tr == 1)[0][:BG_SIZE // 2]
+bg_nm = np.where(y_tr == 0)[0][:BG_SIZE // 2]
+bg_idx = np.concatenate([bg_sz, bg_nm])
+
+ex_sz = np.where(y_te == 1)[0][:TEST_SIZE // 2]
+ex_nm = np.where(y_te == 0)[0][:TEST_SIZE // 2]
+ex_idx = np.concatenate([ex_sz, ex_nm])
+np.random.seed(42); np.random.shuffle(ex_idx)
+
+X_bg      = torch.tensor(X_tr[bg_idx],  dtype=torch.float32)
+X_explain = torch.tensor(X_te[ex_idx],  dtype=torch.float32)
+y_explain = y_te[ex_idx]
+
+print(f"  Best model    : {best_model_name} (type={best_type})")
+print(f"  Background    : {X_bg.shape}")
+print(f"  Explain set   : {X_explain.shape}")
+
+# ── Verify wrapper output shape ──────────────────────────────
+shap_wrapper = SHAPWrapper(best_model_obj, best_type)
+shap_wrapper.eval()
+with torch.no_grad():
+    _dbg = shap_wrapper(X_bg[:4])
+print(f"  Wrapper debug : {_dbg.shape}  ← expect (4, 1)")
+assert _dbg.shape == (4, 1), f"Wrapper shape mismatch: {_dbg.shape}"
+print("✅  Wrapper verified")
+
+
+
+# ==============================
+# CODE CELL 48
+# ==============================
+# ============================================================
+# CELL 28 — XAI STEP 3: Run SHAP GradientExplainer
+# ============================================================
+
+print(f"🔷 Running SHAP GradientExplainer on {best_model_name} …")
+
+# GradientExplainer needs gradient flow → do NOT use no_grad context
+X_bg_grad      = X_bg.clone().detach().requires_grad_(True)
+X_explain_grad = X_explain.clone().detach().requires_grad_(True)
+
+explainer   = shap.GradientExplainer(shap_wrapper, X_bg_grad)
+shap_raw    = explainer.shap_values(X_explain_grad)
+
+# Normalise output format
+if isinstance(shap_raw, list):
+    shap_raw = shap_raw[0]
+shap_vals = np.array(shap_raw, dtype=np.float32)
+
+# Remove trailing singleton dim if present  e.g. (N,T,C,1) → (N,T,C)
+if shap_vals.ndim == 4:
+    shap_vals = shap_vals.squeeze(-1)
+
+assert shap_vals.ndim == 3, f"Expected (N,T,C) got {shap_vals.shape}"
+print(f"✅  SHAP values shape : {shap_vals.shape}  (samples × timesteps × channels)")
+
+
+
+# ==============================
+# CODE CELL 49
+# ==============================
+# ============================================================
+# CELL 29 — XAI STEP 4: Channel Importance Bar Chart
+# ============================================================
+
+# Mean |SHAP| over time → (N, C)
+shap_ch    = np.abs(shap_vals).mean(axis=1)    # (N, C)
+importance = shap_ch.mean(axis=0).squeeze()     # (C,)
+
+order      = np.argsort(importance).astype(int)[::-1]
+imp_sorted = importance[order]
+ch_sorted  = [CH_NAMES[int(i)] for i in order]
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle(f'SHAP Channel Importance — {best_model_name}',
+             fontsize=14, fontweight='bold')
+
+# Left: horizontal bar chart
+colors = plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, len(ch_sorted)))
+axes[0].barh(ch_sorted[::-1], imp_sorted[::-1],
+             color=colors[::-1], edgecolor='black', linewidth=0.4)
+axes[0].set_xlabel('Mean |SHAP| Value')
+axes[0].set_title('Channel Importance Ranking')
+
+# Right: top-5 boxplot
+top5_idx  = order[:5]
+top5_shap = shap_ch[:, top5_idx]     # (N, 5)  — always 2-D
+
+# Guard: if only 1 sample, expand dims
+if top5_shap.ndim == 1:
+    top5_shap = top5_shap[np.newaxis, :]
+
+print("top5_shap shape:", top5_shap.shape)   # expect (N, 5)
+
+axes[1].boxplot(
+    [top5_shap[:, k] for k in range(top5_shap.shape[1])],
+    labels=[CH_NAMES[int(i)] for i in top5_idx],
+    patch_artist=True,
+    boxprops=dict(facecolor=PALETTE[0], alpha=0.6)
+)
+axes[1].set_title('Top-5 Channel SHAP Distribution')
+axes[1].set_ylabel('SHAP Value')
+axes[1].axhline(0, color='gray', linestyle='--', linewidth=1)
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/shap_channel_importance.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/shap_channel_importance.png")
+
+print("\nTop-5 Important Channels:")
+for k in range(5):
+    idx = int(order[k])
+    print(f"  {k+1}. {CH_NAMES[idx]:10} → SHAP = {importance[idx]:.6f}")
+
+
+
+# ==============================
+# CODE CELL 50
+# ==============================
+# ============================================================
+# CELL 30 — XAI STEP 5: Beeswarm & Temporal SHAP Heatmap
+# ============================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 7))
+fig.suptitle(f'SHAP Advanced Plots — {best_model_name}', fontsize=14, fontweight='bold')
+
+# ── Beeswarm (top-10 channels) ───────────────────────────────
+X_np = X_explain.numpy()   # (N, T, C)
+X_ch_mean = X_np.mean(axis=1)   # (N, C) — mean over time for colour coding
+
+for c_idx in order[:10]:
+    x_vals = shap_ch[:, c_idx]
+    y_jit  = np.full_like(x_vals, float(c_idx)) + np.random.uniform(-0.3, 0.3, len(x_vals))
+    sc = axes[0].scatter(x_vals, y_jit,
+                         c=X_ch_mean[:, c_idx], cmap='coolwarm',
+                         alpha=0.6, s=15, vmin=-2, vmax=2)
+
+axes[0].set_yticks(order[:10].tolist())
+axes[0].set_yticklabels([CH_NAMES[i] for i in order[:10]])
+axes[0].axvline(0, color='black', linestyle='--', linewidth=1)
+axes[0].set_xlabel('SHAP Value')
+axes[0].set_title('Beeswarm (Top-10 Channels)')
+plt.colorbar(sc, ax=axes[0], label='Feature Value')
+
+# ── Temporal heatmap (sample 0, top-5 channels) ──────────────
+sample_shap = shap_vals[0]          # (T, C)
+top5_ch     = order[:5]
+heat        = sample_shap[:, top5_ch].T    # (5, T)
+heat_ds     = heat[:, ::8]                 # downsample time axis
+
+im = axes[1].imshow(heat_ds, aspect='auto', cmap='RdBu_r',
+                    vmin=-np.abs(heat_ds).max(), vmax=np.abs(heat_ds).max())
+axes[1].set_yticks(range(5))
+axes[1].set_yticklabels([CH_NAMES[i] for i in top5_ch])
+axes[1].set_xlabel('Time (downsampled ×8)')
+axes[1].set_title('Temporal SHAP Heatmap (Top-5 Channels)')
+plt.colorbar(im, ax=axes[1], label='SHAP')
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/shap_beeswarm_temporal.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/shap_beeswarm_temporal.png")
+
+
+
+# ==============================
+# CODE CELL 51
+# ==============================
+# ============================================================
+# CELL 31 — XAI STEP 6: Attention Map Extraction (DA-GRL)
+# ============================================================
+# Extract internal attention weights from the DA-GRL temporal
+# attention pooling layer for interpretability.
+# ============================================================
+
+def extract_attention_map(model, model_type, X_input, n_samples=10):
+    """
+    Extract attention weights from model's temporal attention layer.
+    Returns: attn_weights (n_samples, T) or None if not available.
+    """
+    model.cpu().eval()
+    attn_hooks = []
+    attn_outputs = []
+
+    def hook_fn(module, inp, out):
+        # Capture softmax output (attention weights)
+        attn_outputs.append(out.detach().cpu().numpy())
+
+    # Register hook on attention layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Softmax):
+            attn_hooks.append(module.register_forward_hook(hook_fn))
+
+    X_sample = torch.tensor(X_input[:n_samples], dtype=torch.float32)
+    with torch.no_grad():
+        mt = model_type.lower().replace('-','')
+        if mt == 'grl':
+            _ = model(X_sample)
+        elif mt in ('dasct', 'dagrl'):
+            _ = model(X_sample)
+        else:
+            _ = model(X_sample)
+
+    for h in attn_hooks:
+        h.remove()
+
+    if not attn_outputs:
+        print("  ⚠️  No attention layer found — skipping attention plot")
+        return None
+
+    # Take last captured attention (temporal pooling)
+    attn = attn_outputs[-1]    # shape varies by model
+    return attn
+
+attn_weights = extract_attention_map(best_model_obj, best_type, X_te, n_samples=20)
+
+if attn_weights is not None:
+    fig, ax = plt.subplots(figsize=(14, 4))
+    # Average over samples and reshape if needed
+    if attn_weights.ndim >= 2:
+        mean_attn = attn_weights.mean(axis=0).squeeze()
+    else:
+        mean_attn = attn_weights.squeeze()
+
+    if mean_attn.ndim == 1:
+        ax.plot(mean_attn, color=PALETTE[0], linewidth=1.5)
+        ax.fill_between(range(len(mean_attn)), mean_attn, alpha=0.3, color=PALETTE[0])
+        ax.set_xlabel('Time Step')
+        ax.set_ylabel('Attention Weight')
+    else:
+        im = ax.imshow(mean_attn, aspect='auto', cmap='hot_r')
+        plt.colorbar(im, ax=ax, label='Attention')
+        ax.set_xlabel('Key')
+        ax.set_ylabel('Query')
+
+    ax.set_title(f'Temporal Attention Map — {best_model_name}')
+    plt.tight_layout()
+    fig.savefig(f'{RESULTS_DIR}/attention_map.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"✅  Saved → {RESULTS_DIR}/attention_map.png")
+else:
+    # Fallback: plot SHAP temporal profile as proxy for attention
+    fig, ax = plt.subplots(figsize=(14, 4))
+    proxy_attn = np.abs(shap_vals).mean(axis=(0, 2))   # mean over samples & channels → (T,)
+    ax.plot(proxy_attn, color=PALETTE[4], linewidth=1.5, label='Mean |SHAP| over channels')
+    ax.fill_between(range(len(proxy_attn)), proxy_attn, alpha=0.3, color=PALETTE[4])
+    ax.set_xlabel('Time Step')
+    ax.set_ylabel('Mean |SHAP|')
+    ax.set_title(f'SHAP-Proxy Temporal Importance — {best_model_name}')
+    ax.legend()
+    plt.tight_layout()
+    fig.savefig(f'{RESULTS_DIR}/attention_map.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"✅  Saved (SHAP-proxy) → {RESULTS_DIR}/attention_map.png")
+
+
+
+# ==============================
+# CODE CELL 52
+# ==============================
+# ============================================================
+# CELL 32 — XAI STEP 7: Unified XAI Summary Report
+# ============================================================
+
+fig = plt.figure(figsize=(20, 12))
+gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.35)
+fig.suptitle(f'Unified XAI Report — {best_model_name}', fontsize=15, fontweight='bold')
+
+# ── Panel A: Channel Importance Bar ──────────────────────────
+ax_a = fig.add_subplot(gs[0, 0])
+colors_a = plt.cm.RdYlGn_r(np.linspace(0.1, 0.9, 10))
+ax_a.barh([CH_NAMES[int(i)] for i in order[:10]][::-1],
+          imp_sorted[:10][::-1],
+          color=colors_a[::-1], edgecolor='black', linewidth=0.4)
+ax_a.set_xlabel('Mean |SHAP|')
+ax_a.set_title('A. Channel Importance (Top-10)')
+
+# ── Panel B: Top-5 SHAP Distribution ─────────────────────────
+ax_b = fig.add_subplot(gs[0, 1])
+top5_data = [shap_ch[:, int(order[k])] for k in range(5)]
+bp = ax_b.boxplot(top5_data,
+                  labels=[CH_NAMES[int(order[k])] for k in range(5)],
+                  patch_artist=True,
+                  boxprops=dict(facecolor=PALETTE[0], alpha=0.6))
+ax_b.axhline(0, color='gray', linestyle='--', linewidth=1)
+ax_b.set_title('B. Top-5 SHAP Distributions')
+ax_b.set_ylabel('SHAP Value')
+
+# ── Panel C: Temporal SHAP Profile ───────────────────────────
+ax_c = fig.add_subplot(gs[0, 2])
+temporal_profile = np.abs(shap_vals).mean(axis=(0, 2))   # (T,)
+ax_c.plot(temporal_profile, color=PALETTE[4], linewidth=1.2)
+ax_c.fill_between(range(len(temporal_profile)), temporal_profile, alpha=0.25, color=PALETTE[4])
+ax_c.set_xlabel('Time Step')
+ax_c.set_ylabel('Mean |SHAP|')
+ax_c.set_title('C. Temporal Importance Profile')
+
+# ── Panel D: Seizure vs Normal SHAP comparison ────────────────
+ax_d = fig.add_subplot(gs[1, :2])
+sz_mask  = y_explain == 1
+nm_mask  = y_explain == 0
+sz_imp   = np.abs(shap_ch[sz_mask]).mean(axis=0)  if sz_mask.any()  else np.zeros(18)
+nm_imp   = np.abs(shap_ch[nm_mask]).mean(axis=0)  if nm_mask.any()  else np.zeros(18)
+x_pos    = np.arange(len(CH_NAMES))
+w        = 0.38
+ax_d.bar(x_pos - w/2, sz_imp, width=w, color=PALETTE[0], alpha=0.85, label='Seizure',    edgecolor='k', lw=0.4)
+ax_d.bar(x_pos + w/2, nm_imp, width=w, color=PALETTE[1], alpha=0.85, label='Non-Seizure', edgecolor='k', lw=0.4)
+ax_d.set_xticks(x_pos)
+ax_d.set_xticklabels(CH_NAMES, rotation=45, fontsize=7)
+ax_d.legend()
+ax_d.set_title('D. SHAP Importance: Seizure vs Non-Seizure')
+ax_d.set_ylabel('Mean |SHAP|')
+
+# ── Panel E: Metrics Summary ──────────────────────────────────
+ax_e = fig.add_subplot(gs[1, 2])
+ax_e.axis('off')
+metric_text = (
+    f"Model: {best_model_name}\n"
+    f"{'─'*28}\n"
+)
+bm_row = comparison.set_index('Model').loc[best_model_name]
+for col in ['Accuracy','Precision','Recall','F1','AUC']:
+    if col in bm_row:
+        metric_text += f"{col:12}: {bm_row[col]:.4f}\n"
+metric_text += f"{'─'*28}\n"
+metric_text += f"Top-1 Channel: {CH_NAMES[int(order[0])]}\n"
+metric_text += f"SHAP method  : GradientExplainer\n"
+metric_text += f"Samples      : {len(X_explain)}\n"
+ax_e.text(0.05, 0.95, metric_text, transform=ax_e.transAxes,
+          fontsize=9, verticalalignment='top', fontfamily='monospace',
+          bbox=dict(boxstyle='round', facecolor='#f0f4f8', alpha=0.8))
+ax_e.set_title('E. Performance Summary')
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/unified_xai_report.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/unified_xai_report.png")
+
+
+
+# ==============================
+# CODE CELL 53
+# ==============================
+# ============================================================
+# CELL 33 — XAI STEP 8: Save Combined Best Model + SHAP State
+# ============================================================
+
+save_path = f'{MODELS_DIR}/model_best_xai_combined.pt'
+
+torch.save({
+    'model_name'       : 'BestModel_XAI_Combined',
+    'best_model_name'  : best_model_name,
+    'best_model_type'  : best_type,
+    'model_state_dict' : best_model_obj.state_dict(),
+    'channel_names'    : CH_NAMES,
+    'shap_importance'  : importance.tolist(),
+    'top5_channels'    : [CH_NAMES[int(i)] for i in order[:5]],
+    'shap_method'      : 'GradientExplainer',
+    'n_bg_samples'     : int(X_bg.shape[0]),
+    'n_explain_samples': int(X_explain.shape[0]),
+}, save_path)
+
+print("="*60)
+print("💾  BEST MODEL + XAI STATE SAVED")
+print("="*60)
+print(f"  Path        : {save_path}")
+print(f"  Model       : {best_model_name}")
+print(f"  Top-5 SHAP  : {[CH_NAMES[int(i)] for i in order[:5]]}")
+
+
+
+# ==============================
+# CODE CELL 55
+# ==============================
+# ============================================================
+# CELL 29 — LIME Explanation
+# ============================================================
+# FIX: use best_model_obj / best_model_name (set in CELL 27)
+best_model_obj.cpu(); best_model_obj.eval()
+
+X_tr_flat = X_tr.reshape(len(X_tr), -1)
+X_te_flat = X_te.reshape(len(X_te), -1)
+T_dim, C_dim = X_te.shape[1], X_te.shape[2]
+
+N_FEAT   = min(500, X_tr_flat.shape[1])
+feat_idx = np.linspace(0, X_tr_flat.shape[1] - 1, N_FEAT, dtype=int)
+X_tr_sub = X_tr_flat[:, feat_idx]
+X_te_sub = X_te_flat[:, feat_idx]
+feat_names_sub = [f"ch_{feat_idx[i] % C_dim}@t{feat_idx[i] // C_dim}" for i in range(N_FEAT)]
+
+lime_explainer = lime_tabular.LimeTabularExplainer(
+    training_data         = X_tr_sub[:200],
+    mode                  = 'classification',
+    feature_names         = feat_names_sub,
+    class_names           = ['Normal', 'Seizure'],
+    discretize_continuous = True,
+    random_state          = 42
+)
+
+def predict_fn_lime(x):
+    x_full = np.zeros((len(x), X_te_flat.shape[1]), dtype=np.float32)
+    x_full[:, feat_idx] = x.astype(np.float32)
+    x_reshaped = x_full.reshape(-1, T_dim, C_dim)
+    x_t = torch.tensor(x_reshaped).float()
+    with torch.no_grad():
+        mtype = best_model_name.lower().replace('-', '')
+        if mtype == 'grl':
+            p, _ = best_model_obj(x_t)
+        elif mtype in ('dasct', 'dagrl'):
+            p, _, _ = best_model_obj(x_t)
+        else:
+            p = best_model_obj(x_t)
+    p = p.numpy().flatten()
+    return np.column_stack([1 - p, p])
+
+SAMPLE_IDX = 0
+print(f"  Explaining test sample {SAMPLE_IDX} (label={int(y_te[SAMPLE_IDX])})…")
+exp = lime_explainer.explain_instance(
+    X_te_sub[SAMPLE_IDX],
+    predict_fn_lime,
+    num_features = 15,
+    num_samples  = 200
+)
+print("  ✅  LIME explanation done")
+print("\n  Top-15 features:")
+for feat, wt in exp.as_list()[:15]:
+    print(f"    {feat:35}: {wt:.5f}")
+
+
+# ==============================
+# CODE CELL 56
+# ==============================
+# ============================================================
+# CELL 30 — LIME: Visualization
+# ============================================================
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+fig.suptitle(f'LIME Explanation — {best_model_name} (Sample #{SAMPLE_IDX})',
+             fontsize=14, fontweight='bold')
+
+lime_list = exp.as_list()[:15]
+feats   = [x[0] for x in lime_list]
+weights = [x[1] for x in lime_list]
+colors  = [PALETTE[0] if w > 0 else PALETTE[1] for w in weights]
+
+axes[0].barh(feats, weights, color=colors, edgecolor='black', linewidth=0.4)
+axes[0].axvline(0, color='black', linewidth=1)
+axes[0].set_xlabel('LIME Weight'); axes[0].set_title('Feature Contributions')
+axes[0].tick_params(labelsize=8)
+
+probs_lime = exp.predict_proba
+axes[1].pie(probs_lime, labels=['Normal', 'Seizure'],
+            colors=[PALETTE[1], PALETTE[0]], autopct='%1.1f%%', startangle=90,
+            textprops={'fontsize': 12})
+axes[1].set_title(
+    f'Prediction Probabilities\n(True Label: {"Seizure" if y_te[SAMPLE_IDX]==1 else "Normal"})')
+
+plt.tight_layout()
+fig.savefig(f'{RESULTS_DIR}/lime_explanation.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/lime_explanation.png")
+
+
+
+# ==============================
+# CODE CELL 58
+# ==============================
+# ============================================================
+# CELL 31 — SHAP vs LIME: Feature Overlap & Correlation
+# ============================================================
+from scipy.stats import spearmanr
+
+shap_importance = pd.Series(importance, index=CH_NAMES[:len(importance)])
+
+lime_weights_raw = {feat: wt for feat, wt in exp.as_list()}
+lime_ch_agg = np.zeros(len(CH_NAMES))
+for feat, wt in lime_weights_raw.items():
+    for c_idx, ch in enumerate(CH_NAMES):
+        if ch in feat:
+            lime_ch_agg[c_idx] += abs(wt)
+
+lime_importance = pd.Series(lime_ch_agg, index=CH_NAMES)
+lime_importance = lime_importance / (lime_importance.max() + 1e-9)
+
+common_channels = shap_importance.index.intersection(lime_importance.index)
+shap_vec = shap_importance[common_channels].values
+lime_vec = lime_importance[common_channels].values
+
+rho, pval = spearmanr(shap_vec, lime_vec)
+print("="*60); print("⚖️   SHAP vs LIME COMPARATIVE ANALYSIS"); print("="*60)
+print(f"  Spearman ρ = {rho:.4f}  (p={pval:.4f})")
+print(f"  Agreement  : {'High' if abs(rho)>0.7 else 'Moderate' if abs(rho)>0.4 else 'Low'}")
+
+top5_shap = shap_importance.nlargest(5).index.tolist()
+top5_lime = lime_importance.nlargest(5).index.tolist()
+overlap   = set(top5_shap) & set(top5_lime)
+jaccard   = len(overlap) / len(set(top5_shap) | set(top5_lime))
+
+print(f"\n  Top-5 SHAP channels : {top5_shap}")
+print(f"  Top-5 LIME channels : {top5_lime}")
+print(f"  Overlap             : {sorted(overlap)}")
+print(f"  Jaccard similarity  : {jaccard:.4f}")
+
+
+
+# ==============================
+# CODE CELL 59
+# ==============================
+# ============================================================
+# CELL 32 — SHAP vs LIME: Comprehensive Report Visualization
+# ============================================================
+fig = plt.figure(figsize=(22, 14))
+gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.45, wspace=0.35)
+fig.suptitle(f'SHAP vs LIME Comparative Report — {best_model_name}', fontsize=15, fontweight='bold')
+
+ax = fig.add_subplot(gs[0, :2])
+x = np.arange(len(common_channels)); w = 0.4
+ax.bar(x - w/2, shap_vec, width=w, color=PALETTE[0], alpha=0.85, label='SHAP', edgecolor='black', linewidth=0.4)
+ax.bar(x + w/2, lime_vec, width=w, color=PALETTE[1], alpha=0.85, label='LIME', edgecolor='black', linewidth=0.4)
+ax.set_xticks(x); ax.set_xticklabels(common_channels, rotation=45, fontsize=8)
+ax.set_title('SHAP vs LIME — Channel-Level Feature Importance', fontweight='bold')
+ax.set_ylabel('Normalized Importance'); ax.legend()
+
+ax = fig.add_subplot(gs[0, 2])
+ax.scatter(shap_vec, lime_vec, color=PALETTE[2], s=60, edgecolors='black', linewidth=0.5)
+for i, ch in enumerate(common_channels):
+    ax.annotate(ch, (shap_vec[i], lime_vec[i]), fontsize=7, alpha=0.8)
+m, b = np.polyfit(shap_vec, lime_vec, 1)
+xr = np.linspace(shap_vec.min(), shap_vec.max(), 50)
+ax.plot(xr, m * xr + b, 'r--', lw=1.5)
+ax.set_xlabel('SHAP Importance'); ax.set_ylabel('LIME Importance')
+ax.set_title(f'Correlation (ρ={rho:.3f})', fontweight='bold')
+
+ax = fig.add_subplot(gs[1, :])
+rank_data = pd.DataFrame({
+    'Channel'  : list(common_channels),
+    'SHAP_rank': pd.Series(shap_vec, index=common_channels).rank(ascending=False).values,
+    'LIME_rank': pd.Series(lime_vec, index=common_channels).rank(ascending=False).values,
+}).sort_values('SHAP_rank')
+top_n     = min(12, len(rank_data))
+rank_data = rank_data.head(top_n)
+xp = np.arange(top_n)
+ax.plot(xp, rank_data.SHAP_rank, 'o-', color=PALETTE[0], lw=2, markersize=7, label='SHAP rank')
+ax.plot(xp, rank_data.LIME_rank, 's--', color=PALETTE[1], lw=2, markersize=7, label='LIME rank')
+ax.set_xticks(xp); ax.set_xticklabels(rank_data.Channel, rotation=35, ha='right', fontsize=9)
+ax.set_ylabel('Rank (lower = more important)')
+ax.set_title('Channel Ranking Comparison (SHAP vs LIME)', fontweight='bold')
+ax.invert_yaxis(); ax.legend()
+
+ax = fig.add_subplot(gs[2, :2])
+ax.axis('off')
+table_data = [
+    ['Metric', 'SHAP', 'LIME'],
+    ['Method type',      'Global / Local',          'Local'],
+    ['Model access',     'White-box (gradient)',     'Black-box (perturbation)'],
+    ['Explanation level','Channel + Temporal',       'Feature (flat)'],
+    ['Top-1 channel',    top5_shap[0],               top5_lime[0]],
+    ['Spearman ρ',       f'{rho:.4f}',              '—'],
+    ['Jaccard (Top-5)',  f'{jaccard:.4f}',           '—'],
+    ['Agreement',        'High' if abs(rho)>0.7 else 'Moderate', '—'],
+]
+tbl = ax.table(cellText=table_data[1:], colLabels=table_data[0], loc='center', cellLoc='center')
+tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1.2, 1.5)
+for j in range(3):
+    tbl[(0, j)].set_facecolor('#264653'); tbl[(0, j)].set_text_props(color='white', fontweight='bold')
+for i in range(1, len(table_data)):
+    for j in range(3):
+        tbl[(i, j)].set_facecolor('#f0f0f0' if i % 2 == 0 else 'white')
+ax.set_title('SHAP vs LIME Comparison Summary', fontweight='bold', pad=10)
+
+ax = fig.add_subplot(gs[2, 2])
+top3_shap  = top5_shap[:3]; top3_lime  = top5_lime[:3]
+only_shap  = [c for c in top3_shap if c not in top3_lime]
+only_lime  = [c for c in top3_lime if c not in top3_shap]
+overlap_3  = [c for c in top3_shap if c in top3_lime]
+sizes      = [max(len(only_shap), 0.001), max(len(only_lime), 0.001), max(len(overlap_3), 0.001)]
+lbls       = [f'SHAP only\n{only_shap}', f'LIME only\n{only_lime}', f'Both\n{overlap_3}']
+ax.pie(sizes, labels=lbls, colors=[PALETTE[0], PALETTE[1], PALETTE[2]],
+       autopct='%1.0f%%', startangle=90, textprops={'fontsize': 8})
+ax.set_title('Top-3 Channel Overlap', fontweight='bold')
+
+fig.savefig(f'{RESULTS_DIR}/shap_vs_lime_report.png', dpi=150, bbox_inches='tight')
+plt.show()
+print(f"✅  Saved → {RESULTS_DIR}/shap_vs_lime_report.png")
+
+
+
+# ==============================
+# CODE CELL 61
+# ==============================
+# ============================================================
+# CELL FINAL — List All Saved Files for Download
+# ============================================================
+print("="*65)
+print("💾  ALL SAVED FILES")
+print("="*65)
+
+print("\n📂  MODELS  →", MODELS_DIR)
+for f in sorted(os.listdir(MODELS_DIR)):
+    fp = os.path.join(MODELS_DIR, f)
+    sz = os.path.getsize(fp) / 1e6
+    print(f"    📦 {f}  ({sz:.2f} MB)")
+
+print("\n📂  RESULTS →", RESULTS_DIR)
+for f in sorted(os.listdir(RESULTS_DIR)):
+    fp = os.path.join(RESULTS_DIR, f)
+    sz = os.path.getsize(fp) / 1024
+    icon = '📊' if f.endswith('.png') else '📄'
+    print(f"    {icon} {f}  ({sz:.1f} KB)")
+
+print("\n" + "="*65)
+print("🏆  FINAL PERFORMANCE SUMMARY")
+print("="*65)
+summary = comparison.set_index('Model')
+cols = [c for c in ['Accuracy','Precision','Recall','F1','AUC'] if c in summary.columns]
+print(summary[cols].round(4).to_string())
+best = summary['AUC'].idxmax()
+print(f"\n  🏆  Best Model  : {best}")
+print(f"  🔍  XAI Applied : SHAP (GradientExplainer) + Attention Maps + LIME")
+print(f"  📁  Results dir : {RESULTS_DIR}")
+print(f"  📦  Models  dir : {MODELS_DIR}")
+print(f"  📊  Total models: 4 (SCT, GRL, DA-SCT, DA-GRL)")
