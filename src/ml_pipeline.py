@@ -149,12 +149,12 @@ def compute_shap_importance(model, sequences, config, top_k=5):
     
     num_channels = config["channels"]
     
-    # Select a diverse background for SHAP (approximating balanced background)
-    bg_size = min(50, len(sequences))
+    # Select a diverse background for SHAP (highly optimized to prevent memory exhaustion)
+    bg_size = min(5, len(sequences))
     background = torch.tensor(sequences[:bg_size]).float()
     
-    # Ensure test samples are representative
-    test_sample = torch.tensor(sequences[::max(1, len(sequences)//10)][:10]).float()
+    # Ensure test samples are representative and memory-friendly
+    test_sample = torch.tensor(sequences[::max(1, len(sequences)//3)][:3]).float()
         
     try:
         explainer = shap.DeepExplainer(wrapper, background)
