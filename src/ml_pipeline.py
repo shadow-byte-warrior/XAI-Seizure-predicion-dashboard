@@ -249,20 +249,33 @@ def run_inference(sequences, model_path, config, shap_enabled=False, top_k=5):
     if len(sequences) == 0:
         return np.array([]), np.array([]), (0,0,0), None, None, None, None
 
-    # Batch Inference
+    # Mini-batch Inference to prevent Out-Of-Memory (OOM) crashes on CPU
     X = torch.tensor(sequences).float()
+    probs_list = []
+    batch_size = 32
+    
+    import gc
     
     with torch.no_grad():
-        outputs = model(X)
-        if isinstance(outputs, (tuple, list)):
-            outputs = outputs[0]
-        probs = outputs.squeeze().numpy()
-        
-    if probs.ndim == 0:
-        probs = np.array([probs])
-        
+        for i in range(0, len(X), batch_size):
+            batch_X = X[i:i+batch_size]
+            outputs = model(batch_X)
+            if isinstance(outputs, (tuple, list)):
+                outputs = outputs[0]
+            
+            p = outputs.squeeze().numpy()
+            if p.ndim == 0:
+                p = np.array([p])
+            probs_list.append(p)
+            
+    probs = np.concatenate(probs_list) if len(probs_list) > 0 else np.array([])
+    
     predictions = (probs > 0.5).astype(int)
     sample_shape = tuple(X[0].unsqueeze(0).shape)
+    
+    # Explicit memory cleanup
+    del X
+    gc.collect()
             
     return predictions, probs, sample_shape, selected_channels, channel_importance, shap_vals, test_sample
 

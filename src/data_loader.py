@@ -1,5 +1,7 @@
 import mne
 import numpy as np
+import tempfile
+import os
 
 def normalize_channel(ch):
     """
@@ -18,15 +20,27 @@ def load_edf(uploaded_file):
         dict: A dictionary containing the raw mne object, channel names, 
               sampling frequency, duration, and the raw data array.
     """
-    temp_file_path = "temp_uploaded_file.edf"
-    with open(temp_file_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
+    # Create a unique temporary file to avoid concurrent session conflicts
+    with tempfile.NamedTemporaryFile(suffix=".edf", delete=False) as temp_file:
+        temp_file.write(uploaded_file.getbuffer())
+        temp_file_path = temp_file.name
         
     try:
         raw = mne.io.read_raw_edf(temp_file_path, preload=True, verbose=False)
         
-        # 1. Normalize Channel Names
-        normalized_names = {ch: normalize_channel(ch) for ch in raw.ch_names}
+        # 1. Normalize Channel Names while strictly guaranteeing uniqueness
+        normalized_names = {}
+        seen = set()
+        for ch in raw.ch_names:
+            norm = normalize_channel(ch)
+            final_norm = norm
+            counter = 1
+            while final_norm in seen:
+                final_norm = f"{norm}_{counter}"
+                counter += 1
+            normalized_names[ch] = final_norm
+            seen.add(final_norm)
+            
         raw.rename_channels(normalized_names)
         
         # 2. Remove Duplicates
@@ -52,6 +66,14 @@ def load_edf(uploaded_file):
         }
     except Exception as e:
         raise ValueError(f"Failed to load EDF file: {str(e)}")
+    finally:
+        # Securely delete the temporary file from the disk
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except Exception:
+                pass
+
 
 STANDARD_CHANNELS = [
     "FP1-F7","F7-T7","T7-P7","P7-O1",
